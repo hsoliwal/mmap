@@ -165,17 +165,14 @@ class ConstraintsTest {
         invalid(() -> validateInitialPoolSize(-1));
         valid(() -> validateMaxOpenFiles(1));
         invalid(() -> validateMaxOpenFiles(0));
-        valid(() -> validateMaxOpenFiles(3, 3));
-        invalid(() -> validateMaxOpenFiles(2, 3));
-        invalid(() -> validateMaxOpenFiles(0, 0));
         valid(() -> validateFilesToCreateAhead(0));
         invalid(() -> validateFilesToCreateAhead(-1));
         valid(() -> validateRegionsToMapAhead(1));
         invalid(() -> validateRegionsToMapAhead(0));
-        for (final int maxAppenders : new int[]{1, 64, 256}) {
+        for (final int maxAppenders : new int[]{1, 2, 64, 100, 256}) {
             valid(() -> validateMaxAppenders(maxAppenders));
         }
-        for (final int maxAppenders : new int[]{0, 2, 128, 512}) {
+        for (final int maxAppenders : new int[]{-1, 0, 257, 512}) {
             invalid(() -> validateMaxAppenders(maxAppenders));
         }
     }

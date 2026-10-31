@@ -51,8 +51,8 @@ class RollingFileMapperTest {
     private static final int REGION_SIZE = (int) REGION_SIZE_GRANULARITY;
     private static final int REGIONS_PER_FILE = 2;
     private static final long MAX_FILE_SIZE = (long) REGIONS_PER_FILE * REGION_SIZE;
-    private static final FileInitialiser READ_WRITE_INITIALISER = FileInitialiser.zeroBytes(AccessMode.READ_WRITE, 0);
-    private static final FileInitialiser READ_ONLY_INITIALISER = FileInitialiser.zeroBytes(AccessMode.READ_ONLY, 0);
+    private static final FileInitialiser READ_WRITE_INITIALISER = FileInitialiser.none();
+    private static final FileInitialiser READ_ONLY_INITIALISER = FileInitialiser.none();
 
     @TempDir
     Path tempDir;
@@ -183,6 +183,31 @@ class RollingFileMapperTest {
     }
 
     @Test
+    void unmapReleasesMappingOfOpenFile() {
+        try (final FileMapper mapper = readWrite(baseFile("open.map"), false, 0, 1)) {
+            final long address = mapper.map(position(0), REGION_SIZE);
+            final Path file0 = OsMappings.realPath(baseFile("open_0.map"));
+            assertTrue(OsMappings.isMapped(file0));
+            mapper.unmap(position(0), address, REGION_SIZE);
+            assertFalse(OsMappings.isMapped(file0));
+        }
+    }
+
+    @Test
+    void unmapReleasesMappingOfAlreadyClosedFile() {
+        try (final FileMapper mapper = readWrite(baseFile("evicted.map"), false, 0, 1)) {
+            final long address0 = mapper.map(position(0), REGION_SIZE);
+            final Path file0 = OsMappings.realPath(baseFile("evicted_0.map"));
+            final long address1 = mapper.map(position(REGIONS_PER_FILE), REGION_SIZE);//closes file 0
+            assertTrue(mapper.toString().contains("|openFiles=1|"), mapper.toString());
+            assertTrue(OsMappings.isMapped(file0), "mapping outlives closing its file");
+            mapper.unmap(position(0), address0, REGION_SIZE);
+            assertFalse(OsMappings.isMapped(file0), "region of closed file must still be unmapped");
+            mapper.unmap(position(REGIONS_PER_FILE), address1, REGION_SIZE);
+        }
+    }
+
+    @Test
     void negativePositionIsNotMapped() {
         try (final FileMapper mapper = readWrite(baseFile("neg.map"), false, 0, 2)) {
             assertEquals(NULL_ADDRESS, mapper.map(-REGION_SIZE, REGION_SIZE));
@@ -197,6 +222,48 @@ class RollingFileMapperTest {
             assertThrows(IllegalArgumentException.class, () -> mapper.unmap(0, address, REGION_SIZE / 2));
             mapper.unmap(0, address, REGION_SIZE);
         }
+    }
+
+    @Test
+    void fileCreatedAheadIsReusedWhenMappingAnEarlierFile() {
+        final File baseFile = baseFile("reuse.map");
+        try (final FileMapper mapper = readWrite(baseFile, false, 1, 3)) {
+            final long address = mapper.map(position(REGIONS_PER_FILE), REGION_SIZE);
+            assertNotEquals(NULL_ADDRESS, address);
+            mapper.unmap(position(REGIONS_PER_FILE), address, REGION_SIZE);
+            assertTrue(mapper.toString().contains("|openFiles=2|"), mapper.toString());
+            //file 0 is new, file 1 is already open and reused when creating ahead
+            writeRegions(mapper, 1);
+            assertTrue(mapper.toString().contains("|openFiles=3|"), mapper.toString());
+        }
+    }
+
+    @Test
+    void readOnlyMapperMapsFileCreatedAfterFailedAttempt() {
+        final File baseFile = baseFile("later.map");
+        try (final FileMapper reader = readOnly(baseFile, 2)) {
+            assertEquals(NULL_ADDRESS, reader.map(position(0), REGION_SIZE));
+            assertEquals(NULL_ADDRESS, reader.map(position(0), REGION_SIZE));
+            try (final FileMapper writer = readWrite(baseFile, false, 0, 2)) {
+                writeRegions(writer, 1);
+            }
+            assertRegions(reader, 1);
+        }
+    }
+
+    @Test
+    void positionBeyondMaxFileIndexIsRejected() {
+        try (final FileMapper mapper = readWrite(baseFile("max.map"), false, 0, 2)) {
+            final long position = (Integer.MAX_VALUE + 1L) * MAX_FILE_SIZE;
+            assertThrows(IllegalArgumentException.class, () -> mapper.map(position, REGION_SIZE));
+        }
+    }
+
+    @Test
+    void maxFileSizeNotMultipleOfRegionSizeIsRejected() {
+        assertThrows(IllegalArgumentException.class, () -> RollingFileMapper.forReadWrite(baseFile("invalid.map"),
+                AccessMode.READ_WRITE, false, 0, REGION_SIZE + REGION_SIZE / 2, REGION_SIZE, 0, 2,
+                READ_WRITE_INITIALISER));
     }
 
     @Test

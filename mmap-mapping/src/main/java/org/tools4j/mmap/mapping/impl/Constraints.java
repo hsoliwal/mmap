@@ -189,13 +189,6 @@ public enum Constraints {
         }
     }
 
-    public static void validateMaxOpenFiles(final int maxOpenFiles, final int threadCount) {
-        if (maxOpenFiles <= 0 || maxOpenFiles < threadCount) {
-            throw new IllegalArgumentException("Max open files must be be at least one and no less than thread count " +
-                    threadCount + " but was " +  maxOpenFiles);
-        }
-    }
-
     public static void validateRegionCacheSize(final int cacheSize) {
         validatePowerOfTwo("Region cache size", cacheSize);
     }
@@ -224,10 +217,11 @@ public enum Constraints {
     }
 
     public static void validateMaxAppenders(final int maxAppenders) {
-        if (maxAppenders == 1 || maxAppenders == 64 || maxAppenders == 256) {
+        if (maxAppenders >= 1 && maxAppenders <= IdPool256.MAX_IDS) {
             return;
         }
-        throw new IllegalArgumentException("Max appenders must be one of [1, 64, 256]");
+        throw new IllegalArgumentException("Max appenders must be in [1, " + IdPool256.MAX_IDS + "] but was " +
+                maxAppenders);
     }
 
     public static void validatePowerOfTwo(final String name, final int value) {

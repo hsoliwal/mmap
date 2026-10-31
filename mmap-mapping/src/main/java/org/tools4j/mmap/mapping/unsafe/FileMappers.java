@@ -30,7 +30,7 @@ import org.tools4j.mmap.mapping.config.MappingConfig;
 
 import java.io.File;
 
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxOpenFiles;
+import static java.util.Objects.requireNonNull;
 
 @Unsafe
 public enum FileMappers {
@@ -42,25 +42,20 @@ public enum FileMappers {
         switch (accessMode) {
             case READ_ONLY:
                 if (config.rollFiles()) {
-                    final int maxThreadCount = maxThreadCountFor(config);
-                    validateMaxOpenFiles(config.maxOpenFiles(), maxThreadCount);
-                    return maxThreadCount > 1
+                    return isAsyncMapping(config)
                             ? ConcurrentRollingFileMapper.forReadOnly(file, config, fileInitialiser)
                             : RollingFileMapper.forReadOnly(file, config, fileInitialiser);
                 }
                 return new ReadOnlyFileMapper(file, fileInitialiser);
             case READ_WRITE:
-            case READ_WRITE_CLEAR:
-                final int maxThreadCount = maxThreadCountFor(config);
                 if (config.rollFiles()) {
-                    validateMaxOpenFiles(config.maxOpenFiles(), maxThreadCount);
-                    return maxThreadCount > 1
+                    return isAsyncMapping(config)
                             ? ConcurrentRollingFileMapper.forReadWrite(file, accessMode, config, fileInitialiser)
                             : RollingFileMapper.forReadWrite(file, accessMode, config, fileInitialiser);
                 }
                 if (config.expandFile()) {
                     return new ExpandableSizeFileMapper(file, config.minFileSize(), config.maxFileSize(),
-                            config.mappingStrategy().regionSize(), fileInitialiser);
+                            config.regionSize(), fileInitialiser);
                 }
                 return new FixedSizeFileMapper(file, config.maxFileSize(), accessMode, fileInitialiser);
             default:
@@ -68,16 +63,34 @@ public enum FileMappers {
         }
     }
 
-    private static int maxThreadCountFor(final MappingConfig config) {
-        int maxThreadCount = 1;
-        if (config.mappingStrategy().asyncMapping().isPresent()) {
-            maxThreadCount++;
+    /**
+     * Async mapping maps from a second thread, which requires a thread-safe rolling file mapper; async unmapping does
+     * not, as unmapping is thread-safe for all file mappers.
+     */
+    private static boolean isAsyncMapping(final MappingConfig config) {
+        return config.mappingStrategy().asyncMapping().isPresent();
+    }
+
+    /**
+     * Returns a file mapper over the same file(s) as the given one, for use by one other thread such as an async
+     * mapping thread. For a {@link ConcurrentRollingFileMapper}, this is a new per-thread file mapper;
+     * all other file mappers except for {@link RollingFileMapper} are thread-safe, and the given file mapper itself is
+     * returned.
+     * <p>
+     * The returned file mapper must not be closed by the caller, it is released when the given file mapper is closed,
+     * which must happen only after the other thread has stopped using it.
+     *
+     * @param fileMapper the file mapper whose file(s) are to be mapped by another thread
+     * @return a file mapper for use by the other thread
+     * @throws IllegalArgumentException if the given file mapper is single-threaded
+     */
+    public static FileMapper forThread(final FileMapper fileMapper) {
+        if (fileMapper instanceof ConcurrentRollingFileMapper.PerThreadFileMapper perThreadFileMapper) {
+            return perThreadFileMapper.newSibling();
         }
-        if (config.mappingStrategy().asyncUnmapping().isPresent()) {
-            maxThreadCount++;
+        if (fileMapper instanceof RollingFileMapper) {
+            throw new IllegalArgumentException("Single-threaded " + fileMapper + " cannot be used by another thread");
         }
-        //NOTE: if mapper/unmapper share the same runtime, we only have 2 threads, but it is difficult to work this out
-        //      from here
-        return maxThreadCount;
+        return requireNonNull(fileMapper);
     }
 }

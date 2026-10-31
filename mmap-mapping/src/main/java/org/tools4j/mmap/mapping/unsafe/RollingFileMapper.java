@@ -31,6 +31,7 @@ import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.FileInitialiser;
 import org.tools4j.mmap.mapping.api.Unsafe;
 import org.tools4j.mmap.mapping.config.MappingConfig;
+import org.tools4j.mmap.mapping.impl.RollingFiles;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -52,8 +53,9 @@ import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
  * A {@link FileMapper} that splits a logical stream across multiple physical files ("rolling"), creating a new file
  * once the current one reaches its maximum size and keeping at most a configured number of files open at a time.
  * <p>
- * <b>Note:</b> This class is <b>not thread safe</b> and must only be used from a single thread. See
- * {@link ConcurrentRollingFileMapper} for a thread-safe alternative.
+ * <b>Note:</b> {@code map} is <b>not thread safe</b> and must only be called from a single thread; {@code unmap} is
+ * thread-safe (it needs no file access), e.g. for async unmapping. See {@link ConcurrentRollingFileMapper} for an
+ * alternative with thread-safe mapping, as required for async mapping.
  */
 @Unsafe
 public class RollingFileMapper implements FileMapper {
@@ -115,7 +117,7 @@ public class RollingFileMapper implements FileMapper {
     public static FileMapper forReadOnly(final File baseFile,
                                          final MappingConfig config,
                                          final FileInitialiser fileInitialiser) {
-        return forReadOnly(baseFile, config.maxFileSize(), config.mappingStrategy().regionSize(), config.maxOpenFiles(),
+        return forReadOnly(baseFile, config.maxFileSize(), config.regionSize(), config.maxOpenFiles(),
                 fileInitialiser);
     }
 
@@ -134,7 +136,7 @@ public class RollingFileMapper implements FileMapper {
                                           final MappingConfig config,
                                           final FileInitialiser fileInitialiser) {
         return forReadWrite(baseFile, accessMode, config.expandFile(), config.minFileSize(), config.maxFileSize(),
-                config.mappingStrategy().regionSize(), config.filesToCreateAhead(), config.maxOpenFiles(),
+                config.regionSize(), config.filesToCreateAhead(), config.maxOpenFiles(),
                 fileInitialiser);
     }
 
@@ -215,17 +217,9 @@ public class RollingFileMapper implements FileMapper {
     }
 
     private File fileForIndex(final int index) {
-        return fileForIndex(baseFile, index);
+        return RollingFiles.fileForIndex(baseFile, index);
     }
 
-    private static File fileForIndex(final File baseFile, final int index) {
-        final String name = baseFile.getName();
-        final int dotIndex = name.lastIndexOf('.');
-        final int nameEnd = dotIndex < 0 ? name.length() : dotIndex;
-        final String ending = dotIndex < 0 ? "" : name.substring(dotIndex);
-        final String prefix = name.substring(0, nameEnd);
-        return new File(baseFile.getParentFile(), prefix + "_" + index + ending);
-    }
 
     private int positionToFileIndex(final long position) {
         final long index = position >>> positionToFileIndexShift;
@@ -238,6 +232,11 @@ public class RollingFileMapper implements FileMapper {
     @Override
     public AccessMode accessMode() {
         return accessMode;
+    }
+
+    @Override
+    public long mappingLimit() {
+        return Long.MAX_VALUE;
     }
 
     @Override
@@ -291,14 +290,8 @@ public class RollingFileMapper implements FileMapper {
         if (length != regionSize) {
             throw new IllegalArgumentException("Length " + length + " must match region size " + regionSize);
         }
-        final int fileIndex = positionToFileIndex(position);
-        final long positionWithinFile = position & positionInFileMask;
-        final FileMapper mapperForIndex = fileMappers.get(fileIndex);
-        if (mapperForIndex == null) {
-            return;
-        }
-        touch(fileIndex);
-        mapperForIndex.unmap(positionWithinFile, address, length);
+        //NOTE: unmapping needs no file mapper, the mapping outlives the file if it was closed meanwhile
+        FileChannels.unmap(address, length);
     }
 
     private void closeFilesIfNecessary() {

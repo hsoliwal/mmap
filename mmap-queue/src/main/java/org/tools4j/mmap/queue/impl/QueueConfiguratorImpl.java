@@ -32,32 +32,34 @@ import org.tools4j.mmap.queue.config.QueueConfig;
 import org.tools4j.mmap.queue.config.QueueConfigurator;
 import org.tools4j.mmap.queue.config.ReaderConfig;
 import org.tools4j.mmap.queue.config.ReaderConfigurator;
-import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.config.MappingStrategyConfig;
 import org.tools4j.mmap.mapping.config.MappingStrategyConfigurator;
 
 import java.util.function.Consumer;
 
 import static java.util.Objects.requireNonNull;
-import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultAccessMode;
+import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultHeaderRegionSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMaxAppenders;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMaxHeaderFileSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMaxPayloadFileSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMinHeaderFileSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMinPayloadFileSize;
+import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultPayloadRegionSize;
 import static org.tools4j.mmap.queue.impl.QueueConfigDefaults.QUEUE_CONFIG_DEFAULTS;
 import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxAppenders;
 import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxFileSize;
 import static org.tools4j.mmap.mapping.impl.Constraints.validateMinFileSize;
+import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
 
 public class QueueConfiguratorImpl implements QueueConfigurator {
     private final QueueConfig defaults;
-    private AccessMode accessMode;
     private int maxAppenders;
     private long minHeaderFileSize;
     private long maxHeaderFileSize;
     private long minPayloadFileSize;
     private long maxPayloadFileSize;
+    private int headerRegionSize;
+    private int payloadRegionSize;
     private Boolean expandHeaderFile;
     private Boolean expandPayloadFiles;
     private Boolean rollHeaderFile;
@@ -79,12 +81,13 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator reset() {
-        accessMode = null;
         maxAppenders = 0;
         minHeaderFileSize = -1;
         maxHeaderFileSize = 0;
         minPayloadFileSize = -1;
         maxPayloadFileSize = 0;
+        headerRegionSize = 0;
+        payloadRegionSize = 0;
         expandHeaderFile = null;
         expandPayloadFiles = null;
         rollHeaderFile = null;
@@ -94,23 +97,6 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
         entryReaderConfig = null;
         entryIteratorConfig = null;
         indexReaderConfig = null;
-        return this;
-    }
-
-    @Override
-    public AccessMode accessMode() {
-        if (accessMode == null) {
-            accessMode = defaults.accessMode();
-        }
-        if (accessMode == null) {
-            accessMode = defaultAccessMode();
-        }
-        return accessMode;
-    }
-
-    @Override
-    public QueueConfigurator accessMode(final AccessMode accessMode) {
-        this.accessMode = requireNonNull(accessMode);
         return this;
     }
 
@@ -201,6 +187,42 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
     public QueueConfigurator maxPayloadFileSize(final long maxPayloadFileSize) {
         validateMaxFileSize(maxPayloadFileSize);
         this.maxPayloadFileSize = maxPayloadFileSize;
+        return this;
+    }
+
+    @Override
+    public int headerRegionSize() {
+        if (headerRegionSize <= 0) {
+            headerRegionSize = defaults.headerRegionSize();
+        }
+        if (headerRegionSize <= 0) {
+            headerRegionSize = defaultHeaderRegionSize();
+        }
+        return headerRegionSize;
+    }
+
+    @Override
+    public QueueConfigurator headerRegionSize(final int headerRegionSize) {
+        validateRegionSize(headerRegionSize);
+        this.headerRegionSize = headerRegionSize;
+        return this;
+    }
+
+    @Override
+    public int payloadRegionSize() {
+        if (payloadRegionSize <= 0) {
+            payloadRegionSize = defaults.payloadRegionSize();
+        }
+        if (payloadRegionSize <= 0) {
+            payloadRegionSize = defaultPayloadRegionSize();
+        }
+        return payloadRegionSize;
+    }
+
+    @Override
+    public QueueConfigurator payloadRegionSize(final int payloadRegionSize) {
+        validateRegionSize(payloadRegionSize);
+        this.payloadRegionSize = payloadRegionSize;
         return this;
     }
 
@@ -309,9 +331,7 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator mappingStrategy(final Consumer<? super MappingStrategyConfigurator> configurator) {
-        final MappingStrategyConfigurator config = MappingStrategyConfigurator.configure();
-        configurator.accept(config);
-        return mappingStrategy(config);
+        return headerMappingStrategy(configurator).payloadMappingStrategy(configurator);
     }
 
     @Override
@@ -332,9 +352,13 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator headerMappingStrategy(final Consumer<? super MappingStrategyConfigurator> configurator) {
-        final MappingStrategyConfigurator config = MappingStrategyConfigurator.configure();
-        configurator.accept(config);
-        return headerMappingStrategy(config);
+        requireNonNull(configurator);
+        appenderConfig(cfg -> cfg.headerMappingStrategy(configurator));
+        pollerConfig(cfg -> cfg.headerMappingStrategy(configurator));
+        entryReaderConfig(cfg -> cfg.headerMappingStrategy(configurator));
+        entryIteratorConfig(cfg -> cfg.headerMappingStrategy(configurator));
+        indexReaderConfig(cfg -> cfg.headerMappingStrategy(configurator));
+        return this;
     }
 
     @Override
@@ -354,9 +378,12 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator payloadMappingStrategy(final Consumer<? super MappingStrategyConfigurator> configurator) {
-        final MappingStrategyConfigurator config = MappingStrategyConfigurator.configure();
-        configurator.accept(config);
-        return payloadMappingStrategy(config);
+        requireNonNull(configurator);
+        appenderConfig(cfg -> cfg.payloadMappingStrategy(configurator));
+        pollerConfig(cfg -> cfg.payloadMappingStrategy(configurator));
+        entryReaderConfig(cfg -> cfg.payloadMappingStrategy(configurator));
+        entryIteratorConfig(cfg -> cfg.payloadMappingStrategy(configurator));
+        return this;
     }
 
     @Override
@@ -375,8 +402,7 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator appenderConfig(final Consumer<? super AppenderConfigurator> configurator) {
-        final AppenderConfigurator config = appenderConfig != null ?
-                AppenderConfigurator.configure(appenderConfig) : AppenderConfigurator.configure();
+        final AppenderConfigurator config = AppenderConfigurator.configure(appenderConfig());
         configurator.accept(config);
         this.appenderConfig = config;
         return this;
@@ -398,8 +424,7 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator pollerConfig(final Consumer<? super ReaderConfigurator> configurator) {
-        final ReaderConfigurator config = pollerConfig != null ?
-                ReaderConfigurator.configure(pollerConfig) : ReaderConfigurator.configurePoller();
+        final ReaderConfigurator config = ReaderConfigurator.configure(pollerConfig());
         configurator.accept(config);
         this.pollerConfig = config;
         return this;
@@ -421,8 +446,7 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator entryReaderConfig(final Consumer<? super ReaderConfigurator> configurator) {
-        final ReaderConfigurator config = entryReaderConfig != null ?
-                ReaderConfigurator.configure(entryReaderConfig) : ReaderConfigurator.configureEntryReader();
+        final ReaderConfigurator config = ReaderConfigurator.configure(entryReaderConfig());
         configurator.accept(config);
         this.entryReaderConfig = config;
         return this;
@@ -444,8 +468,7 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator entryIteratorConfig(final Consumer<? super ReaderConfigurator> configurator) {
-        final ReaderConfigurator config = entryIteratorConfig != null ?
-                ReaderConfigurator.configure(entryIteratorConfig) : ReaderConfigurator.configureEntryIterator();
+        final ReaderConfigurator config = ReaderConfigurator.configure(entryIteratorConfig());
         configurator.accept(config);
         this.entryIteratorConfig = config;
         return this;
@@ -467,8 +490,7 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
 
     @Override
     public QueueConfigurator indexReaderConfig(final Consumer<? super IndexReaderConfigurator> configurator) {
-        final IndexReaderConfigurator config = indexReaderConfig != null ?
-                IndexReaderConfigurator.configure(indexReaderConfig) : IndexReaderConfigurator.configure();
+        final IndexReaderConfigurator config = IndexReaderConfigurator.configure(indexReaderConfig());
         configurator.accept(config);
         this.indexReaderConfig = config;
         return this;
@@ -482,12 +504,13 @@ public class QueueConfiguratorImpl implements QueueConfigurator {
     @Override
     public String toString() {
         return "QueueConfiguratorImpl" +
-                ":accessMode=" + accessMode +
-                "|maxAppenders=" + maxAppenders +
+                ":maxAppenders=" + maxAppenders +
                 "|minHeaderFileSize=" + minHeaderFileSize +
                 "|maxHeaderFileSize=" + maxHeaderFileSize +
                 "|minPayloadFileSize=" + minPayloadFileSize +
                 "|maxPayloadFileSize=" + maxPayloadFileSize +
+                "|headerRegionSize=" + headerRegionSize +
+                "|payloadRegionSize=" + payloadRegionSize +
                 "|expandHeaderFile=" + expandHeaderFile +
                 "|expandPayloadFiles=" + expandPayloadFiles +
                 "|rollHeaderFile=" + rollHeaderFile +
