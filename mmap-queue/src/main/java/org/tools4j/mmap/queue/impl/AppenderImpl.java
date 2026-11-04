@@ -23,16 +23,18 @@
  */
 package org.tools4j.mmap.queue.impl;
 
+import org.agrona.BitUtil;
+import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.AtomicBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.queue.api.Appender;
 import org.tools4j.mmap.queue.api.AppendingContext;
 import org.tools4j.mmap.queue.api.Index;
-import org.tools4j.mmap.mapping.api.ElasticMapping;
 
 import java.nio.ByteBuffer;
 
@@ -51,25 +53,30 @@ final class AppenderImpl implements Appender {
     private final int appenderId;
     private final ElasticMapping header;
     private final ElasticMapping payload;
-    private final boolean enableCopyFromPreviousRegion;
     private final AppendingContextImpl context;
+    private final Runnable onClose;
     private long endIndex;
     private long lastOwnHeader;
     private int lastOwnPayloadLength;
     private boolean closed;
 
-    public AppenderImpl(final String queueName, final AppenderMappings mappings, final boolean enableCopyFromPreviousRegion) {
-        this.queueName = requireNonNull(queueName);
-        this.mappings = requireNonNull(mappings);
-        this.appenderId = mappings.appenderId();
-        this.header = requireNonNull(mappings.header());
-        this.payload = requireNonNull(mappings.payload());
-        this.enableCopyFromPreviousRegion = enableCopyFromPreviousRegion;
-        this.context = new AppendingContextImpl(this);
-        this.endIndex = Index.NULL;
-        this.lastOwnHeader = NULL_HEADER;
-        this.lastOwnPayloadLength = -1;
-        initialMoveToEnd();
+    public AppenderImpl(final String queueName, final AppenderMappings mappings, final Runnable onClose) {
+        try {
+            this.queueName = requireNonNull(queueName);
+            this.mappings = requireNonNull(mappings);
+            this.appenderId = mappings.appenderId();
+            this.header = requireNonNull(mappings.header());
+            this.payload = requireNonNull(mappings.payload());
+            this.context = new AppendingContextImpl(this);
+            this.onClose = requireNonNull(onClose);
+            this.endIndex = Index.NULL;
+            this.lastOwnHeader = NULL_HEADER;
+            this.lastOwnPayloadLength = -1;
+            initialMoveToEnd();
+        } catch (final Throwable t) {
+            CloseHelper.quietClose(mappings);
+            throw t;
+        }
     }
 
     private void checkIndexNotExceedingMax(final long index) {
@@ -95,7 +102,20 @@ final class AppenderImpl implements Appender {
         checkIndexNotExceedingMax(endIndex);
         this.endIndex = endIndex;
         this.lastOwnHeader = lastOwnHeader;
-        this.lastOwnPayloadLength = -1;
+        this.lastOwnPayloadLength = lastOwnHeader == NULL_HEADER ? -1 : payloadLength(lastOwnHeader);
+    }
+
+    /**
+     * Returns the payload length including length prefix of an entry previously appended with this appender's ID, for
+     * instance by a previous owner of the ID, so that new payload is appended after it.
+     */
+    private int payloadLength(final long ownHeader) {
+        final long payloadPosition = Headers.payloadPosition(ownHeader);
+        if (!payload.moveTo(payloadPosition)) {
+            throw payloadMoveException(this, payloadPosition);
+        }
+        //NOTE: plain read is safe, the length was written before the header, which we read with acquire semantics
+        return payload.buffer().getInt(0) + Integer.BYTES;
     }
 
     @Override
@@ -195,16 +215,20 @@ final class AppenderImpl implements Appender {
             lastOwnHeader = NULL_HEADER;
             lastOwnPayloadLength = -1;
             mappings.close();
+            onClose.run();
             LOGGER.info("Appender closed: {}", appenderName());
         }
     }
 
     private static final class AppendingContextImpl implements AppendingContext {
+        static final int MIN_COPY_BUFFER_CAPACITY = 4096;
         final AppenderImpl appender;
         final ElasticMapping payload;
         final int maxEntrySize;
         final MutableDirectBuffer buffer = new UnsafeBuffer(0, 0);
         int maxLength = -1;
+        /** Lazily allocated to copy encoded data to the next region if the previous region is not kept mapped */
+        UnsafeBuffer copyBuffer;
 
         AppendingContextImpl(final AppenderImpl appender) {
             this.appender = requireNonNull(appender);
@@ -268,17 +292,33 @@ final class AppenderImpl implements Appender {
             final int minRequired = capacity + Integer.BYTES;
             final ElasticMapping pld = payload;
             if (pld.bytesAvailable() < minRequired) {
-                if (!appender.enableCopyFromPreviousRegion) {
-                    throw new IllegalStateException("Need to enable payload region cache (for async no less than map-ahead + 2) to fully support ensureCapacity(..)");
+                if (max == 0) {
+                    //nothing to copy
+                    moveToNextPayloadRegion(pld);
+                } else if (appender.mappings.keepsPreviousPayloadRegionMapped()) {
+                    moveToNextPayloadRegion(pld);
+                    //NOTE: copy data from buffer to the mapping buffer
+                    //      --> the buffer is still wrapped at old region address
+                    //      --> old region address is still mapped because the region cache defers unmapping
+                    buffer.getBytes(0, pld.buffer(), Integer.BYTES, max);
+                } else {
+                    final UnsafeBuffer copy = copyBuffer(max);
+                    buffer.getBytes(0, copy, 0, max);
+                    moveToNextPayloadRegion(pld);
+                    copy.getBytes(0, pld.buffer(), Integer.BYTES, max);
                 }
-                moveToNextPayloadRegion(pld);
-                //NOTE: copy data from buffer to the mapping buffer
-                //      --> the buffer is still wrapped at old region address
-                //      --> old region address is still mapped because a region cache is in use
-                pld.buffer().getBytes(Integer.BYTES, buffer, 0, max);
             }
             buffer.wrap(pld.buffer(), Integer.BYTES, capacity);
             maxLength = capacity;
+        }
+
+        private UnsafeBuffer copyBuffer(final int length) {
+            final UnsafeBuffer copy = copyBuffer;
+            if (copy != null && copy.capacity() >= length) {
+                return copy;
+            }
+            final int capacity = BitUtil.findNextPositivePowerOfTwo(Math.max(MIN_COPY_BUFFER_CAPACITY, length));
+            return copyBuffer = new UnsafeBuffer(ByteBuffer.allocateDirect(capacity));
         }
 
         @Override

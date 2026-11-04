@@ -27,18 +27,17 @@ import org.tools4j.mmap.queue.config.AppenderConfig;
 import org.tools4j.mmap.queue.config.IndexReaderConfig;
 import org.tools4j.mmap.queue.config.QueueConfig;
 import org.tools4j.mmap.queue.config.ReaderConfig;
-import org.tools4j.mmap.mapping.api.AccessMode;
 
-import static java.util.Objects.requireNonNull;
 import static org.tools4j.mmap.queue.impl.QueueConfigDefaults.QUEUE_CONFIG_DEFAULTS;
 
 public class QueueConfigImpl implements QueueConfig {
-    private final AccessMode accessMode;
     private final int maxAppenders;
     private final long minHeaderFileSize;
     private final long maxHeaderFileSize;
     private final long minPayloadFileSize;
     private final long maxPayloadFileSize;
+    private final int headerRegionSize;
+    private final int payloadRegionSize;
     private final boolean expandHeaderFile;
     private final boolean expandPayloadFiles;
     private final boolean rollHeaderFile;
@@ -54,12 +53,13 @@ public class QueueConfigImpl implements QueueConfig {
     }
 
     public QueueConfigImpl(final QueueConfig queueConfig) {
-        this(queueConfig.accessMode(),
-                queueConfig.maxAppenders(),
+        this(queueConfig.maxAppenders(),
                 queueConfig.minHeaderFileSize(),
                 queueConfig.maxHeaderFileSize(),
                 queueConfig.minPayloadFileSize(),
                 queueConfig.maxPayloadFileSize(),
+                queueConfig.headerRegionSize(),
+                queueConfig.payloadRegionSize(),
                 queueConfig.expandHeaderFile(),
                 queueConfig.expandPayloadFiles(),
                 queueConfig.rollHeaderFile(),
@@ -71,12 +71,13 @@ public class QueueConfigImpl implements QueueConfig {
                 queueConfig.indexReaderConfig());
     }
 
-    public QueueConfigImpl(final AccessMode accessMode,
-                           final int maxAppenders,
+    public QueueConfigImpl(final int maxAppenders,
                            final long minHeaderFileSize,
                            final long maxHeaderFileSize,
                            final long minPayloadFileSize,
                            final long maxPayloadFileSize,
+                           final int headerRegionSize,
+                           final int payloadRegionSize,
                            final boolean expandHeaderFile,
                            final boolean expandPayloadFiles,
                            final boolean rollHeaderFile,
@@ -86,12 +87,13 @@ public class QueueConfigImpl implements QueueConfig {
                            final ReaderConfig entryReaderConfig,
                            final ReaderConfig entryIteratorConfig,
                            final IndexReaderConfig indexReaderConfig) {
-        this.accessMode = requireNonNull(accessMode);
         this.maxAppenders = maxAppenders;
         this.minHeaderFileSize = minHeaderFileSize;
         this.maxHeaderFileSize = maxHeaderFileSize;
         this.minPayloadFileSize = minPayloadFileSize;
         this.maxPayloadFileSize = maxPayloadFileSize;
+        this.headerRegionSize = headerRegionSize;
+        this.payloadRegionSize = payloadRegionSize;
         this.expandHeaderFile = expandHeaderFile;
         this.expandPayloadFiles = expandPayloadFiles;
         this.rollHeaderFile = rollHeaderFile;
@@ -101,11 +103,6 @@ public class QueueConfigImpl implements QueueConfig {
         this.entryReaderConfig = entryReaderConfig.toImmutableReaderConfig();
         this.entryIteratorConfig = entryIteratorConfig.toImmutableReaderConfig();
         this.indexReaderConfig = indexReaderConfig.toImmutableIndexReaderConfig();
-    }
-
-    @Override
-    public AccessMode accessMode() {
-        return accessMode;
     }
 
     @Override
@@ -131,6 +128,16 @@ public class QueueConfigImpl implements QueueConfig {
     @Override
     public long maxPayloadFileSize() {
         return maxPayloadFileSize;
+    }
+
+    @Override
+    public int headerRegionSize() {
+        return headerRegionSize;
+    }
+
+    @Override
+    public int payloadRegionSize() {
+        return payloadRegionSize;
     }
 
     @Override
@@ -186,12 +193,13 @@ public class QueueConfigImpl implements QueueConfig {
     @Override
     public String toString() {
         return "QueueConfigImpl" +
-                ":accessMode=" + accessMode +
-                "|maxAppenders=" + maxAppenders +
+                ":maxAppenders=" + maxAppenders +
                 "|minHeaderFileSize=" + minHeaderFileSize +
                 "|maxHeaderFileSize=" + maxHeaderFileSize +
                 "|minPayloadFileSize=" + minPayloadFileSize +
                 "|maxPayloadFileSize=" + maxPayloadFileSize +
+                "|headerRegionSize=" + headerRegionSize +
+                "|payloadRegionSize=" + payloadRegionSize +
                 "|expandHeaderFile=" + expandHeaderFile +
                 "|expandPayloadFiles=" + expandPayloadFiles +
                 "|rollHeaderFile=" + rollHeaderFile +

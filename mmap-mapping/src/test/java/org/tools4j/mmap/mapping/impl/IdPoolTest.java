@@ -24,8 +24,13 @@
 package org.tools4j.mmap.mapping.impl;
 
 import org.agrona.LangUtil;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.tools4j.mmap.mapping.api.Mapping;
+import org.tools4j.mmap.mapping.api.Mappings;
+import org.tools4j.mmap.mapping.api.OpenMode;
 
 import java.io.File;
 import java.nio.file.Files;
@@ -37,7 +42,9 @@ import java.util.function.Function;
 
 import static java.util.Objects.requireNonNull;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Unit test for {@link IdPool}, {@link IdPool64} and {@link IdPool256}
@@ -48,7 +55,8 @@ class IdPoolTest {
 
     enum PoolFactory {
         IdPool64(64, IdPool64::new),
-        IdPool256(256, IdPool256::new);
+        IdPool256(256, IdPool256::new),
+        IdPool256Max100(100, file -> new IdPool256(file, 100));
         final int maxIds;
         private final Function<File, IdPool> factoryMethod;
 
@@ -124,6 +132,103 @@ class IdPoolTest {
         final int repeat = 3;
         final long maxWaitMillis = 20;
         runConcurrentTest(poolFactory, threads, repeat, maxWaitMillis);
+    }
+
+    @Test
+    void poolsWithDifferentMaxIdsShareFile() throws Exception {
+        //given
+        final Path tmpDir = Files.createTempDirectory(getClass().getSimpleName());
+        final File file = new File(tmpDir.toFile(), "test.ids");
+        try (final IdPool single = new IdPool256(file, 1);
+             final IdPool all = new IdPool256(file)) {
+            //then
+            assertEquals(IdPool256.FILE_SIZE, file.length());
+
+            //when + then
+            assertEquals(0, single.acquire());
+            assertThrows(IllegalStateException.class, single::acquire);
+            assertThrows(IllegalArgumentException.class, () -> single.release(1));
+            assertEquals(1, all.acquire());
+            assertEquals(2, single.acquired());
+
+            //when + then
+            assertTrue(all.release(0));
+            assertEquals(0, single.acquire());
+        }
+    }
+
+    @ParameterizedTest(name = "maxIds={0}")
+    @ValueSource(ints = {1, 2, 63, 64, 65, 100, 127, 128, 129, 191, 192, 193, 200, 255, 256})
+    void acquiresExactlyIdsBelowMaxIds(final int maxIds) throws Exception {
+        //given
+        final Path tmpDir = Files.createTempDirectory(getClass().getSimpleName());
+        final File file = new File(tmpDir.toFile(), "test.ids");
+        try (final IdPool limited = new IdPool256(file, maxIds);
+             final IdPool all = new IdPool256(file)) {
+            //when + then
+            for (int id = 0; id < maxIds; id++) {
+                assertEquals(id, limited.acquire());
+            }
+            assertThrows(IllegalStateException.class, limited::acquire);
+            assertThrows(IllegalArgumentException.class, () -> limited.release(maxIds));
+
+            //then: IDs from maxIds upwards remain available
+            for (int id = maxIds; id < IdPool256.MAX_IDS; id++) {
+                assertEquals(id, all.acquire());
+            }
+            assertThrows(IllegalStateException.class, all::acquire);
+
+            //when + then: released ID below maxIds is acquired again
+            assertTrue(limited.release(maxIds - 1));
+            assertEquals(maxIds - 1, limited.acquire());
+        }
+    }
+
+    @Test
+    void releasingIdNotAcquiredReturnsFalseAndCloseIsIdempotent() throws Exception {
+        final Path tmpDir = Files.createTempDirectory(getClass().getSimpleName());
+        final File file = new File(tmpDir.toFile(), "test.ids");
+        final IdPool pool = new IdPool256(file.getPath(),
+                Mappings.fixedMapping(file, OpenMode.OPEN_OR_CREATE, 0L, IdPool256.FILE_SIZE));
+        assertFalse(pool.release(70));
+        assertEquals(0, pool.acquire());
+        assertTrue(pool.release(0));
+        assertFalse(pool.release(0));
+        pool.close();
+        assertTrue(pool.isClosed());
+        pool.close();
+        assertTrue(pool.isClosed());
+    }
+
+    @Test
+    void mappingOfWrongSizeIsRejected() throws Exception {
+        final Path tmpDir = Files.createTempDirectory(getClass().getSimpleName());
+        final File file = new File(tmpDir.toFile(), "test.ids");
+        try (final Mapping mapping = Mappings.fixedMapping(file, OpenMode.OPEN_OR_CREATE, 0L, IdPool64.FILE_SIZE)) {
+            assertThrows(IllegalArgumentException.class, () -> new IdPool256(file.getPath(), mapping));
+            assertTrue(mapping.isClosed(), "owned mapping must be closed if construction fails");
+        }
+        try (final Mapping mapping = Mappings.fixedMapping(file, OpenMode.OPEN_OR_CREATE, 0L, IdPool256.FILE_SIZE)) {
+            assertThrows(IllegalArgumentException.class, () -> new IdPool64(file.getPath(), mapping));
+            assertTrue(mapping.isClosed(), "owned mapping must be closed if construction fails");
+        }
+        final Mapping mapping64 = Mappings.fixedMapping(file, OpenMode.OPEN_OR_CREATE, 0L, IdPool64.FILE_SIZE);
+        assertThrows(NullPointerException.class, () -> new IdPool64(null, mapping64));
+        assertTrue(mapping64.isClosed(), "owned mapping must be closed if name is null");
+        final Mapping mapping256 = Mappings.fixedMapping(file, OpenMode.OPEN_OR_CREATE, 0L, IdPool256.FILE_SIZE);
+        assertThrows(NullPointerException.class, () -> new IdPool256(null, mapping256));
+        assertTrue(mapping256.isClosed(), "owned mapping must be closed if name is null");
+    }
+
+    @Test
+    void invalidMaxIds() throws Exception {
+        final Path tmpDir = Files.createTempDirectory(getClass().getSimpleName());
+        final File file = new File(tmpDir.toFile(), "test.ids");
+        assertThrows(IllegalArgumentException.class, () -> new IdPool256(file, 0));
+        assertThrows(IllegalArgumentException.class, () -> new IdPool256(file, IdPool256.MAX_IDS + 1));
+        final Mapping mapping = Mappings.fixedMapping(file, OpenMode.OPEN_OR_CREATE, 0L, IdPool256.FILE_SIZE);
+        assertThrows(IllegalArgumentException.class, () -> new IdPool256(file.getPath(), mapping, 0));
+        assertTrue(mapping.isClosed(), "owned mapping must be closed if construction fails");
     }
 
     private void runConcurrentTest(final PoolFactory poolFactory,

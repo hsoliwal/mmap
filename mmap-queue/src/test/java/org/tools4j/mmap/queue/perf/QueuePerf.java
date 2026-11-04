@@ -28,6 +28,7 @@ import net.openhft.affinity.AffinityThreadFactory;
 import org.HdrHistogram.Histogram;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.mapping.api.OpenMode;
 import org.tools4j.mmap.queue.api.Entry;
 import org.tools4j.mmap.queue.api.EntryIterator;
 import org.tools4j.mmap.queue.api.EntryReader;
@@ -240,9 +241,10 @@ public class QueuePerf {
         //final SharingPolicy sharingPolicy = SharingPolicy.PER_THREAD;
         final SharingPolicy sharingPolicy = SharingPolicy.SHARED;
         final QueueConfig config = QueueConfig.configure()
+                .headerRegionSize(regionSize)
+                .payloadRegionSize(regionSize)
                 .appenderConfig(conf -> conf
                         .mappingStrategy(cfg -> cfg
-                                .regionSize(regionSize)
                                 .cacheSize(cacheSize)
                                 .deferUnmapping(false)
                                 .asyncMapping(async -> async
@@ -254,7 +256,6 @@ public class QueuePerf {
                 )
                 .pollerConfig(conf -> conf
                         .headerMappingStrategy(cfg -> cfg
-                                .regionSize(regionSize)
                                 .cacheSize(cacheSize)
                                 .deferUnmapping(false)
                                 .asyncMapping(async -> async
@@ -264,7 +265,6 @@ public class QueuePerf {
                                 )
                         )
                         .payloadMappingStrategy(cfg -> cfg
-                                .regionSize(regionSize)
                                 .cacheSize(cacheSize)
                                 .deferUnmapping(false)
                                 .asyncMapping(async -> async
@@ -287,7 +287,6 @@ public class QueuePerf {
                 )
                 .entryReaderConfig(conf -> conf
                         .mappingStrategy(cfg -> cfg
-                                .regionSize(regionSize)
                                 .cacheSize(cacheSize)
                                 .deferUnmapping(true)
                                 .asyncMapping(false)
@@ -296,7 +295,6 @@ public class QueuePerf {
                 )
                 .indexReaderConfig(conf -> conf
                         .headerMappingStrategy(cfg -> cfg
-                                .regionSize(regionSize)
                                 .cacheSize(cacheSize)
                                 .deferUnmapping(true)
                                 .asyncMapping(false)
@@ -305,7 +303,6 @@ public class QueuePerf {
                 )
                 .entryIteratorConfig(conf -> conf
                         .mappingStrategy(cfg -> cfg
-                                .regionSize(regionSize)
                                 .cacheSize(cacheSize)
                                 .deferUnmapping(false)
                                 .asyncMapping(true)
@@ -362,8 +359,8 @@ public class QueuePerf {
         final ThreadFactory threadFactory = Thread::new;
 //        final ThreadFactory threadFactory = new AffinityThreadFactory("affinity", AffinityStrategies.ANY);
 
-        try (final Queue queue = Queue.create(new File(tempDir.toFile(), "perfQ"), config)) {
-//        try (final Queue queue = Queue.create(new File(tempDir.toFile(), "perfQ"))) {
+        try (final Queue queue = Queue.open(new File(tempDir.toFile(), "perfQ"), OpenMode.OPEN_OR_CREATE, config)) {
+//        try (final Queue queue = Queue.open(new File(tempDir.toFile(), "perfQ"))) {
             LOGGER.info("Queue created: {}", queue);
 
             final Sender sender = new Sender((byte) 0, threadFactory, queue::createAppender, messagesPerSecond, messages, messageLength);

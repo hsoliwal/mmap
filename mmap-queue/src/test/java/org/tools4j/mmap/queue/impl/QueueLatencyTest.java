@@ -27,6 +27,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.tools4j.mmap.mapping.api.OpenMode;
 import org.tools4j.mmap.queue.api.Appender;
 import org.tools4j.mmap.queue.api.Poller;
 import org.tools4j.mmap.queue.api.Queue;
@@ -50,6 +51,9 @@ import java.util.stream.Stream;
 import static java.util.Objects.requireNonNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * Latency test for {@link Queue} and {@link QueueImpl} with concurrent senders and receivers.
+ */
 public class QueueLatencyTest {
 
     private static final int REGION_CACHE_SIZE = 16;
@@ -79,7 +83,7 @@ public class QueueLatencyTest {
             tempDir = Files.createTempDirectory(QueueLatencyTest.class.getSimpleName());
             tempDir.toFile().deleteOnExit();
 
-            queue = Queue.create(new File(tempDir.toFile(), "mmap-queue"), config);
+            queue = Queue.open(new File(tempDir.toFile(), "mmap-queue"), OpenMode.OPEN_OR_CREATE, config);
 
             appender = queue.createAppender();
             poller = queue.createPoller();

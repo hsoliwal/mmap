@@ -27,9 +27,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.AdaptiveMapping;
 import org.tools4j.mmap.mapping.api.Mappings;
+import org.tools4j.mmap.mapping.api.OpenMode;
 
 import java.nio.file.Path;
 
@@ -47,7 +47,7 @@ class AdaptiveMappingImplTest {
 
     @BeforeEach
     void init(@TempDir final Path tempDir) {
-        mapping = Mappings.adaptiveMapping(tempDir.resolve("adaptive.map").toFile(), AccessMode.READ_WRITE);
+        mapping = Mappings.adaptiveMapping(tempDir.resolve("adaptive.map").toFile(), OpenMode.OPEN_OR_CREATE);
         regionSize = mapping.regionSize();
     }
 
@@ -91,6 +91,58 @@ class AdaptiveMappingImplTest {
         assertTrue(mapping.moveBy(regionSize, 20));
         assertEquals(regionSize + 100L, mapping.position());
         assertEquals(20, mapping.length());
+    }
+
+    @Test
+    void moveByPreservesLengthOrTruncatesItAtRegionEnd() {
+        assertThrows(IllegalStateException.class, () -> mapping.moveBy(10));
+        assertTrue(mapping.moveTo(100, 10));
+
+        assertTrue(mapping.moveBy(50));
+        assertEquals(150, mapping.position());
+        assertEquals(10, mapping.length());
+
+        assertTrue(mapping.moveBy(regionSize - 155));
+        assertEquals(regionSize - 5, mapping.position());
+        assertEquals(5, mapping.length());
+
+        assertTrue(mapping.moveBy(5));
+        assertEquals(regionSize, mapping.position());
+        assertEquals(5, mapping.length());
+
+        assertThrows(IllegalArgumentException.class, () -> mapping.moveBy(-regionSize - 1));
+    }
+
+    @Test
+    void moveToPreservesLengthOrTruncatesItAtRegionEnd() {
+        assertTrue(mapping.moveTo(100));
+        assertEquals(regionSize - 100, mapping.length());
+
+        assertTrue(mapping.moveTo(100, 10));
+        assertTrue(mapping.moveTo(200));
+        assertEquals(10, mapping.length());
+        assertTrue(mapping.moveTo(regionSize - 3));
+        assertEquals(3, mapping.length());
+    }
+
+    @Test
+    void moveToSamePositionOnlyAdjustsLength() {
+        assertTrue(mapping.moveTo(100, 10));
+        final long address = mapping.address();
+        assertTrue(mapping.moveTo(100, 10));
+        assertEquals(10, mapping.length());
+        assertTrue(mapping.moveTo(100, 20));
+        assertEquals(20, mapping.length());
+        assertEquals(address, mapping.address());
+    }
+
+    @Test
+    void closeIsIdempotent() {
+        assertTrue(mapping.moveTo(100, 10));
+        mapping.close();
+        assertTrue(mapping.isClosed());
+        mapping.close();
+        assertTrue(mapping.isClosed());
     }
 
     @Test
