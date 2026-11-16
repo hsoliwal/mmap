@@ -23,15 +23,17 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
+import org.tools4j.mmap.core.base.Closeable;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
-import org.tools4j.mmap.mapping.api.Closeable;
 import org.tools4j.mmap.mapping.api.Mapping;
 import org.tools4j.mmap.mapping.api.RegionAware;
-import org.tools4j.mmap.mapping.api.Unsafe;
 
-import static org.tools4j.mmap.mapping.impl.Constraints.validateAddress;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionPosition;
+import java.io.UncheckedIOException;
+
+import static org.tools4j.mmap.core.internal.Validations.validateNotClosed;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateAddress;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionPosition;
 
 /**
  * Low level API to map regions with implementation dependant optimisations such as unmapping, caching and pre-mapping
@@ -59,9 +61,11 @@ public interface RegionMapper extends RegionAware, Closeable {
      * Attempts to map the buffer at the specified position and returns the address at which the region was mapped.
      *
      * @param position      the requested position, a non-negative value and a multiple of region size
-     * @return  the address at which the region was mapped, or zero if mapping failed for instance because the file to
-     *          map does not exist yet
+     * @return  the address at which the region was mapped, or {@code NULL_ADDRESS} if the region is not available yet,
+     *          for instance because the file to map does not exist yet
      * @throws IllegalArgumentException if position is negative or not a multiple of region size
+     * @throws IllegalStateException if this mapper is closed, or if mapping fails, see {@link FileMapper#map(long, int)}
+     * @throws UncheckedIOException if mapping fails with an I/O error
      * @see #regionSize()
      */
     default long map(final long position) {

@@ -23,10 +23,8 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.RegionMetrics;
-import org.tools4j.mmap.mapping.api.Unsafe;
 import org.tools4j.mmap.mapping.impl.RegionMetricsImpl;
 
 import static java.util.Objects.requireNonNull;
@@ -38,7 +36,6 @@ import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
  */
 @Unsafe
 record SyncRegionMapper(FileMapper fileMapper, RegionMetrics regionMetrics) implements DirectRegionMapper {
-    private static final Logger LOGGER = LoggerFactory.getLogger(SyncRegionMapper.class);
 
     public SyncRegionMapper(final FileMapper fileMapper, final int regionSize) {
         this(fileMapper, new RegionMetricsImpl(regionSize));
@@ -51,13 +48,9 @@ record SyncRegionMapper(FileMapper fileMapper, RegionMetrics regionMetrics) impl
 
     @Override
     public long mapInternal(final long position, final int regionSize) {
-        try {
-            final long addr = fileMapper.map(position, regionSize);
-            return addr > 0 ? addr : NULL_ADDRESS;
-        } catch (final Exception exception) {
-            LOGGER.error("Failed to map position {} with region size {}: {}", position, regionSize, exception, exception);
-            return NULL_ADDRESS;
-        }
+        //NOTE: no pre-touch, mapped synchronously for immediate use
+        final long addr = fileMapper.map(position, regionSize, false);
+        return addr > 0 ? addr : NULL_ADDRESS;
     }
 
     @Override
@@ -74,7 +67,6 @@ record SyncRegionMapper(FileMapper fileMapper, RegionMetrics regionMetrics) impl
     public void close() {
         if (!isClosed()) {
             fileMapper.close();
-            LOGGER.info("Closed {}.", this);
         }
     }
 

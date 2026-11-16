@@ -55,13 +55,16 @@ public enum RollingFiles {
      * @return the existing rolling files, empty if there are none
      */
     public static File[] listFiles(final File baseFile) {
-        final String name = baseFile.getName();
-        final int nameEnd = nameEnd(name);
-        final Pattern pattern = Pattern.compile(Pattern.quote(name.substring(0, nameEnd)) + "_\\d+" +
-                Pattern.quote(name.substring(nameEnd)));
+        final Pattern pattern = filePattern(baseFile.getName());
         final File dir = requireNonNull(baseFile.getAbsoluteFile().getParentFile());
         final File[] files = dir.listFiles((d, fileName) -> pattern.matcher(fileName).matches());
         return files == null ? new File[0] : files;
+    }
+
+    private static Pattern filePattern(final String name) {
+        final int nameEnd = nameEnd(name);
+        return Pattern.compile(Pattern.quote(name.substring(0, nameEnd)) + "_\\d+" +
+                Pattern.quote(name.substring(nameEnd)));
     }
 
     private static int nameEnd(final String name) {

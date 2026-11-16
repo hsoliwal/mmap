@@ -23,7 +23,7 @@
  */
 package org.tools4j.mmap.queue.api;
 
-import org.agrona.DirectBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBuffer;
 
 /**
  * Handler when {@link Poller#poll(EntryHandler) polling} entries via a {@link Poller}
@@ -34,6 +34,10 @@ public interface EntryHandler {
      * <p>
      * Note that the returned value determines the next entry to poll; seek operations performed on the poller from
      * within this method are overridden by it.
+     * <p>
+     * The buffer itself is always safe to use, as the poller re-wraps or unwraps it, but after this call it may
+     * access another entry's data, or none (zero capacity). A flyweight wrapping it is not safe: don't keep such a
+     * flyweight beyond this call, as its memory may then be unmapped, and accessing it could crash the JVM.
      *
      * @param index entry index in the queue
      * @param buffer buffer with access to entry data, with valid byte range {@code [offset...(offset + length - 1)]}
@@ -43,5 +47,5 @@ public interface EntryHandler {
      *          one entry backwards, zero to stay on the current entry, or also {@link Move#FIRST}, {@link Move#LAST}
      *          and {@link Move#END} to move to the first entry, last entry or to the end of the queue, respectively
      */
-    long onEntry(long index, DirectBuffer buffer, int offset, int length);
+    long onEntry(long index, MemoryBuffer buffer, int offset, int length);
 }

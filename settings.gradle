@@ -1,3 +1,5 @@
 include (
+    'mmap-core',
     'mmap-mapping',
-    'mmap-queue')
+    'mmap-queue',
+    'mmap-perf')

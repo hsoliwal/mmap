@@ -23,12 +23,14 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
+import org.tools4j.mmap.core.idle.Idler;
+
 import java.util.concurrent.atomic.AtomicReference;
 
 final class Timeout {
     public static final long GRACEFUL_TIMEOUT_MILLIS = 4000;
     public static final long TOTAL_TIMEOUT_MILLIS = 5000;
-    private static final long MIN_WAIT_MILLIS = 20;
+    private final Idler idler = Idler.backoff();
 
     enum Termination {
         STOP_GRACEFULLY,
@@ -93,6 +95,7 @@ final class Timeout {
         if (termination.get() == null) {
             throw new IllegalStateException("Must stop before awaiting");
         }
+        idler.reset();
         long end = System.currentTimeMillis() + timeoutMillis;
         while (termination.get() != Termination.STOPPED) {
             if (System.currentTimeMillis() > end || !sleep()) {
@@ -102,12 +105,8 @@ final class Timeout {
         return true;
     }
 
-    private static boolean sleep() {
-        try {
-            Thread.sleep(Timeout.MIN_WAIT_MILLIS);
-            return true;
-        } catch (final InterruptedException e) {
-            return false;
-        }
+    private boolean sleep() {
+        idler.idle();
+        return !Thread.interrupted();
     }
 }

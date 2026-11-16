@@ -23,19 +23,27 @@
  */
 package org.tools4j.mmap.mapping.config;
 
-import org.agrona.concurrent.IdleStrategy;
-import org.agrona.concurrent.NoOpIdleStrategy;
-import org.agrona.concurrent.YieldingIdleStrategy;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.idle.IdleMode;
+import org.tools4j.mmap.core.idle.Idler;
+import org.tools4j.mmap.core.logging.LoggingLifecycleListener;
+import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.AsyncRuntimeInstances;
+import org.tools4j.mmap.mapping.api.FileInitialiser;
+import org.tools4j.mmap.mapping.api.PreAccessHook;
+import org.tools4j.mmap.mapping.impl.AsyncRuntimeImpl;
+import org.tools4j.mmap.mapping.impl.PinnedThreadFactory;
 
 import java.util.function.Supplier;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -45,11 +53,33 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class MappingConfigurationsTest {
 
-    /** Supplier returning the same idle strategy every time, instantiated via the idle strategy property */
-    public static final class NoOpIdleStrategySupplier implements Supplier<IdleStrategy> {
+    /** Custom idler, instantiated via the idler property */
+    public static final class CustomIdler implements Idler {
         @Override
-        public IdleStrategy get() {
-            return NoOpIdleStrategy.INSTANCE;
+        public void idle() {
+            Thread.onSpinWait();
+        }
+    }
+
+    /** Supplier returning the same idler every time, instantiated via the idler property */
+    public static final class BusySpinIdlerSupplier implements Supplier<Idler> {
+        @Override
+        public Idler get() {
+            return Idler.busySpin();
+        }
+    }
+
+    /** Custom lifecycle listener, instantiated via the lifecycle listener property */
+    public static final class CustomLifecycleListener implements LifecycleListener {}
+
+    /** Another custom lifecycle listener, instantiated via the lifecycle listener property */
+    public static final class OtherLifecycleListener implements LifecycleListener {}
+
+    /** Custom file initialiser, instantiated via the file initialiser property */
+    public static final class CustomFileInitialiser implements FileInitialiser {
+        @Override
+        public PreAccessHook hook(final AccessMode accessMode) {
+            return PreAccessHook.NO_OP;
         }
     }
 
@@ -60,7 +90,54 @@ class MappingConfigurationsTest {
         System.clearProperty(MappingConfigurations.MAX_OPEN_FILES_PROPERTY);
         System.clearProperty(MappingConfigurations.MAX_FILE_SIZE_PROPERTY);
         System.clearProperty(MappingConfigurations.INITIAL_MAPPING_POOL_SIZE_PROPERTY);
-        System.clearProperty(MappingConfigurations.MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY);
+        System.clearProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY);
+        System.clearProperty(MappingConfigurations.UNMAPPING_RUNTIME_IDLER_PROPERTY);
+        System.clearProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY);
+        System.clearProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY);
+        System.clearProperty(MappingConfigurations.FILE_INITIALISER_PROPERTY);
+    }
+
+    @Test
+    void mappingRuntimeCpusPropertyDefaultsToUnpinnedThreads() {
+        assertSame(AsyncRuntimeImpl.DEFAULT_THREAD_FACTORY, MappingConfigurations.defaultMappingRuntimeThreadFactory());
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY, " none ");
+        assertSame(AsyncRuntimeImpl.DEFAULT_THREAD_FACTORY, MappingConfigurations.defaultMappingRuntimeThreadFactory());
+    }
+
+    @Test
+    void mappingRuntimeCpusPropertyCreatesPinnedThreadFactoryOncePerValue() {
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY, "2 - 5");
+        final PinnedThreadFactory range = assertInstanceOf(PinnedThreadFactory.class,
+                MappingConfigurations.defaultMappingRuntimeThreadFactory());
+        assertArrayEquals(new int[]{2, 3, 4, 5}, range.cpus());
+        assertSame(range, MappingConfigurations.defaultMappingRuntimeThreadFactory());
+
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY, "3");
+        final PinnedThreadFactory single = assertInstanceOf(PinnedThreadFactory.class,
+                MappingConfigurations.defaultMappingRuntimeThreadFactory());
+        assertArrayEquals(new int[]{3}, single.cpus());
+
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY, "6,0,2,4");
+        assertArrayEquals(new int[]{6, 0, 2, 4}, assertInstanceOf(PinnedThreadFactory.class,
+                MappingConfigurations.defaultMappingRuntimeThreadFactory()).cpus());
+
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY, "0-");
+        final PinnedThreadFactory toMax = assertInstanceOf(PinnedThreadFactory.class,
+                MappingConfigurations.defaultMappingRuntimeThreadFactory());
+        assertEquals(0, toMax.cpus()[0]);
+        assertTrue(toMax.cpus().length >= Runtime.getRuntime().availableProcessors(), toMax::toString);
+        assertNotSame(range, toMax);
+    }
+
+    @Test
+    void mappingRuntimeCpusPropertyRejectsInvalidValue() {
+        for (final String invalid : new String[]{"x", "-1", "1,1", "1,,2", "3-2", "1-x", "8192", "FIXED:1",
+                String.class.getName()}) {
+            System.setProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY, invalid);
+            final IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    MappingConfigurations::defaultMappingRuntimeThreadFactory, invalid);
+            assertTrue(e.getMessage().contains(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY), e::getMessage);
+        }
     }
 
     @Test
@@ -106,9 +183,9 @@ class MappingConfigurationsTest {
     }
 
     @Test
-    void defaultUnmappingIdleStrategySupplierReturnsNewInstances() {
-        assertNotSame(MappingConfigurations.defaultUnmappingRuntimeIdleStrategySupplier().get(),
-                MappingConfigurations.defaultUnmappingRuntimeIdleStrategySupplier().get());
+    void defaultUnmappingIdlerSupplierReturnsNewInstances() {
+        assertNotSame(MappingConfigurations.defaultUnmappingRuntimeIdlerSupplier().get(),
+                MappingConfigurations.defaultUnmappingRuntimeIdlerSupplier().get());
     }
 
     @Test
@@ -148,38 +225,123 @@ class MappingConfigurationsTest {
     }
 
     @Test
-    void idleStrategyPropertyDefault() {
-        assertSame(MappingConfigurations.MAPPING_RUNTIME_IDLE_STRATEGY_DEFAULT,
-                MappingConfigurations.defaultMappingRuntimeIdleStrategySupplier());
+    void idlerPropertyDefaultsToBackoff() {
+        assertSame(IdleMode.BACKOFF, MappingConfigurations.MAPPING_RUNTIME_IDLER_DEFAULT);
+        assertEquals(Idler.backoff().toString(),
+                MappingConfigurations.defaultMappingRuntimeIdlerSupplier().get().toString());
+        assertEquals(Idler.backoff().toString(),
+                MappingConfigurations.defaultUnmappingRuntimeIdlerSupplier().get().toString());
     }
 
     @Test
-    void idleStrategyPropertyWithIdleStrategyClassCreatesNewInstances() {
-        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY,
-                YieldingIdleStrategy.class.getName());
-        final Supplier<? extends IdleStrategy> supplier = MappingConfigurations.defaultMappingRuntimeIdleStrategySupplier();
-        final IdleStrategy first = supplier.get();
-        assertInstanceOf(YieldingIdleStrategy.class, first);
-        assertInstanceOf(YieldingIdleStrategy.class, supplier.get());
+    void idlerPropertyWithIdleModeName() {
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY, "BUSY_SPIN");
+        assertSame(Idler.busySpin(), MappingConfigurations.defaultMappingRuntimeIdlerSupplier().get());
+        System.setProperty(MappingConfigurations.UNMAPPING_RUNTIME_IDLER_PROPERTY, "YIELDING");
+        assertSame(Idler.yielding(), MappingConfigurations.defaultUnmappingRuntimeIdlerSupplier().get());
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY, "BACKOFF");
+        final Supplier<? extends Idler> backoff = MappingConfigurations.defaultMappingRuntimeIdlerSupplier();
+        assertNotSame(backoff.get(), backoff.get());
+    }
+
+    @Test
+    void idlerPropertyWithIdlerClassCreatesNewInstances() {
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY, CustomIdler.class.getName());
+        final Supplier<? extends Idler> supplier = MappingConfigurations.defaultMappingRuntimeIdlerSupplier();
+        final Idler first = supplier.get();
+        assertInstanceOf(CustomIdler.class, first);
+        assertInstanceOf(CustomIdler.class, supplier.get());
         assertNotSame(first, supplier.get());
     }
 
     @Test
-    void idleStrategyPropertyWithSupplierClassDelegatesToSupplier() {
-        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY,
-                NoOpIdleStrategySupplier.class.getName());
-        final Supplier<? extends IdleStrategy> supplier = MappingConfigurations.defaultMappingRuntimeIdleStrategySupplier();
-        assertSame(NoOpIdleStrategy.INSTANCE, supplier.get());
-        assertSame(NoOpIdleStrategy.INSTANCE, supplier.get());
+    void idlerPropertyWithSupplierClassDelegatesToSupplier() {
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY, BusySpinIdlerSupplier.class.getName());
+        final Supplier<? extends Idler> supplier = MappingConfigurations.defaultMappingRuntimeIdlerSupplier();
+        assertSame(Idler.busySpin(), supplier.get());
+        assertSame(Idler.busySpin(), supplier.get());
     }
 
     @Test
-    void idleStrategyPropertyWithInvalidClassFailsOnFirstUse() {
-        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY, "no.such.IdleStrategy");
-        assertThrows(IllegalArgumentException.class,
-                MappingConfigurations.defaultMappingRuntimeIdleStrategySupplier()::get);
-        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY, String.class.getName());
-        assertThrows(IllegalArgumentException.class,
-                MappingConfigurations.defaultMappingRuntimeIdleStrategySupplier()::get);
+    void idlerPropertyWithInvalidValueFailsOnFirstUse() {
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY, "no.such.Idler");
+        assertThrows(IllegalArgumentException.class, MappingConfigurations.defaultMappingRuntimeIdlerSupplier()::get);
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY, String.class.getName());
+        assertThrows(IllegalArgumentException.class, MappingConfigurations.defaultMappingRuntimeIdlerSupplier()::get);
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_IDLER_PROPERTY, "backoff");
+        assertThrows(IllegalArgumentException.class, MappingConfigurations.defaultMappingRuntimeIdlerSupplier()::get,
+                "mode names are case-sensitive");
+    }
+
+    @Test
+    void lifecycleListenerPropertyDefaultsToLoggingAtDebugLevel() {
+        assertSame(LoggingLifecycleListener.DEBUG, MappingConfigurations.defaultLifecycleListener());
+    }
+
+    @Test
+    void lifecycleListenerPropertyAcceptsLogLevelsLoggingInternalResourcesAtDebugLevel() {
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, MappingConfigurations.LOG_DEBUG_LISTENER);
+        assertSame(LoggingLifecycleListener.DEBUG, MappingConfigurations.defaultLifecycleListener());
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, MappingConfigurations.LOG_INFO_LISTENER);
+        final LifecycleListener info = MappingConfigurations.defaultLifecycleListener();
+        assertSame(info, MappingConfigurations.defaultLifecycleListener());
+        assertTrue(info.toString().endsWith("condition=MappingResources.INTERNAL|matching=" +
+                LoggingLifecycleListener.DEBUG + "|other=" + LoggingLifecycleListener.INFO), info::toString);
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, MappingConfigurations.LOG_WARN_LISTENER);
+        final LifecycleListener warn = MappingConfigurations.defaultLifecycleListener();
+        assertTrue(warn.toString().endsWith("condition=MappingResources.INTERNAL|matching=" +
+                LoggingLifecycleListener.DEBUG + "|other=" + LoggingLifecycleListener.WARN), warn::toString);
+    }
+
+    @Test
+    void lifecycleListenerPropertyAcceptsNoOp() {
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, MappingConfigurations.NO_OP_LISTENER);
+        assertSame(LifecycleListener.NO_OP, MappingConfigurations.defaultLifecycleListener());
+    }
+
+    @Test
+    void lifecycleListenerPropertyWithClassNameCreatesOneInstancePerPropertyValue() {
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, CustomLifecycleListener.class.getName());
+        final LifecycleListener lifecycleListener = MappingConfigurations.defaultLifecycleListener();
+        assertInstanceOf(CustomLifecycleListener.class, lifecycleListener);
+        assertSame(lifecycleListener, MappingConfigurations.defaultLifecycleListener());
+
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, OtherLifecycleListener.class.getName());
+        assertInstanceOf(OtherLifecycleListener.class, MappingConfigurations.defaultLifecycleListener());
+    }
+
+    @Test
+    void lifecycleListenerPropertyWithInvalidValueIsRejected() {
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, "no.such.Listener");
+        assertThrows(IllegalArgumentException.class, MappingConfigurations::defaultLifecycleListener);
+        System.setProperty(MappingConfigurations.LIFECYCLE_LISTENER_PROPERTY, "LOGGING");
+        assertThrows(IllegalArgumentException.class, MappingConfigurations::defaultLifecycleListener);
+    }
+
+    @Test
+    void lifecycleListenerForName() {
+        assertSame(LoggingLifecycleListener.DEBUG, MappingConfigurations.lifecycleListenerForName("LOG_DEBUG"));
+        assertSame(MappingConfigurations.lifecycleListenerForName("LOG_INFO"),
+                MappingConfigurations.lifecycleListenerForName("LOG_INFO"));
+        assertSame(LifecycleListener.NO_OP, MappingConfigurations.lifecycleListenerForName("NO_OP"));
+        assertNull(MappingConfigurations.lifecycleListenerForName("log_debug"));
+        assertNull(MappingConfigurations.lifecycleListenerForName(null));
+    }
+
+    @Test
+    void fileInitialiserPropertyDefaultsToLazyAndAcceptsNamesAndClassNames() {
+        assertSame(FileInitialiser.LAZY, MappingConfigurations.defaultFileInitialiser());
+        System.setProperty(MappingConfigurations.FILE_INITIALISER_PROPERTY, "ZERO");
+        assertSame(FileInitialiser.ZERO, MappingConfigurations.defaultFileInitialiser());
+        System.setProperty(MappingConfigurations.FILE_INITIALISER_PROPERTY, "MINUS_ONE");
+        assertSame(FileInitialiser.MINUS_ONE, MappingConfigurations.defaultFileInitialiser());
+        System.setProperty(MappingConfigurations.FILE_INITIALISER_PROPERTY, "LAZY");
+        assertSame(FileInitialiser.LAZY, MappingConfigurations.defaultFileInitialiser());
+        System.setProperty(MappingConfigurations.FILE_INITIALISER_PROPERTY, CustomFileInitialiser.class.getName());
+        final FileInitialiser initialiser = MappingConfigurations.defaultFileInitialiser();
+        assertInstanceOf(CustomFileInitialiser.class, initialiser);
+        assertSame(initialiser, MappingConfigurations.defaultFileInitialiser());
+        System.setProperty(MappingConfigurations.FILE_INITIALISER_PROPERTY, CustomLifecycleListener.class.getName());
+        assertThrows(IllegalArgumentException.class, MappingConfigurations::defaultFileInitialiser);
     }
 }

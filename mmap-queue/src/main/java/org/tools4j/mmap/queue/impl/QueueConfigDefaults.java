@@ -23,20 +23,24 @@
  */
 package org.tools4j.mmap.queue.impl;
 
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.config.CoreConfigurations;
 import org.tools4j.mmap.queue.config.AppenderConfig;
 import org.tools4j.mmap.queue.config.IndexReaderConfig;
 import org.tools4j.mmap.queue.config.QueueConfig;
+import org.tools4j.mmap.queue.config.QueueConfigurations;
 import org.tools4j.mmap.queue.config.ReaderConfig;
 
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultExpandHeaderFile;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultExpandPayloadFiles;
+import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultHeaderRegionSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMaxAppenders;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMaxHeaderFileSize;
-import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultHeaderRegionSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMaxPayloadFileSize;
-import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultPayloadRegionSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMinHeaderFileSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultMinPayloadFileSize;
+import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultPayloadRegionSize;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultRollHeaderFile;
 import static org.tools4j.mmap.queue.config.QueueConfigurations.defaultRollPayloadFiles;
 import static org.tools4j.mmap.queue.impl.AppenderConfigDefaults.APPENDER_CONFIG_DEFAULTS;
@@ -129,6 +133,16 @@ public enum QueueConfigDefaults implements QueueConfig {
     }
 
     @Override
+    public LifecycleListener lifecycleListener() {
+        return QueueConfigurations.defaultLifecycleListener();
+    }
+
+    @Override
+    public ErrorListener errorListener() {
+        return CoreConfigurations.defaultErrorListener();
+    }
+
+    @Override
     public QueueConfig toImmutableQueueConfig() {
         return new QueueConfigImpl(this);
     }
@@ -151,6 +165,8 @@ public enum QueueConfigDefaults implements QueueConfig {
                 "|pollerConfig={" + pollerConfig() + "}" +
                 "|entryReaderConfig={" + entryReaderConfig() + "}" +
                 "|entryIteratorConfig={" + entryIteratorConfig() + "}" +
-                "|indexReaderConfig={" + indexReaderConfig() + "}";
+                "|indexReaderConfig={" + indexReaderConfig() + "}" +
+                "|lifecycleListener=" + lifecycleListener() +
+                "|errorListener=" + errorListener();
     }
 }

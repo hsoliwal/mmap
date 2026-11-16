@@ -23,12 +23,12 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
 import org.tools4j.mmap.mapping.api.ElasticMapping;
-import org.tools4j.mmap.mapping.impl.StepBijection;
 import org.tools4j.mmap.queue.api.Index;
 
 import java.time.Duration;
@@ -263,7 +263,7 @@ public class HeadersTest {
     public void binarySearchLastIndexEndsAtMaxIndexIfAllHeadersArePresent() {
         //not reachable with a real header file, but probing must neither exceed Index.MAX nor loop forever
         final ElasticMapping header = mock(ElasticMapping.class);
-        final UnsafeBuffer buffer = new UnsafeBuffer(new byte[Headers.HEADER_LENGTH]);
+        final MutableMemoryBuffer buffer = MemoryBuffers.allocate(Headers.HEADER_LENGTH);
         buffer.putLong(0, Headers.header(0, 0));
         when(header.moveTo(anyLong())).thenReturn(true);
         when(header.buffer()).thenReturn(buffer);
@@ -276,7 +276,7 @@ public class HeadersTest {
     /** Header mapping with non-empty headers for indices up to and including lastIndex */
     private static ElasticMapping headersUpToIndex(final long lastIndex) {
         final ElasticMapping header = mock(ElasticMapping.class);
-        final UnsafeBuffer buffer = new UnsafeBuffer(new byte[Headers.HEADER_LENGTH]);
+        final MutableMemoryBuffer buffer = MemoryBuffers.allocate(Headers.HEADER_LENGTH);
         when(header.moveTo(anyLong())).thenAnswer(invocation -> {
             final long index = Headers.indexForHeaderPosition(invocation.getArgument(0));
             buffer.putLong(0, index <= lastIndex ? Headers.header(0, 0) : Headers.NULL_HEADER);

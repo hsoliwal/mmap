@@ -25,7 +25,6 @@ package org.tools4j.mmap.queue.impl;
 
 import org.tools4j.mmap.queue.api.Index;
 import org.tools4j.mmap.mapping.api.ElasticMapping;
-import org.tools4j.mmap.mapping.impl.IdPool256;
 
 /**
  * Methods to encode and decode header values, and related methods.
@@ -54,7 +53,7 @@ enum Headers {
      */
     public static final int APPENDER_ID_BITS = Byte.SIZE;
     /**
-     * At most 256 appenders, whose IDs can for instance be managed by {@link IdPool256}
+     * At most 256 appenders, whose IDs can for instance be managed by {@link AppenderIdPool}
      */
     public static final int MAX_APPENDERS = 1 << APPENDER_ID_BITS;
     /**
@@ -88,7 +87,8 @@ enum Headers {
      * Mapping of entry index to position to minimize updating of the same cache line when writing sequential entries.
      * <p>
      * NOTES: <pre>
-     *    - StepBijection algorithm is used, inlined here to allow for compiler optimizations
+     *    - the StepBijection algorithm is used, inlined here to allow for compiler optimizations (the reference
+     *      implementation is in the tests, which check the inlined constants against it)
      *    - block size is 4096 bytes which is typically the size of a memory page (64*64 bytes for a cache line
      *      length of 64)
      *    - all constants are part of the queue format (see QueueMetaFile) and must not depend on the platform
@@ -102,8 +102,6 @@ enum Headers {
     static final int BIJECTION_BLOCK_SIZE = 4096/HEADER_LENGTH;
     private static final long BIJECTION_BLOCK_MASK_LO = BIJECTION_BLOCK_SIZE - 1;
     private static final long BIJECTION_BLOCK_MASK_HI = ~BIJECTION_BLOCK_MASK_LO;
-    //private static final IndexBijection headerIndexBijection = new StepBijection(BIJECTION_BLOCK_MASK, BIJECTION_STEP_FW);
-    //private static final IndexBijection headerIndexBijection = new BlockBijection(CACHE_LINE_LENGTH, CACHE_LINE_LENGTH);
     public static final long NULL_HEADER = 0;
 
 
@@ -184,13 +182,11 @@ enum Headers {
 
     public static long headerPositionForIndex(final long index) {
         assert validIndex(index) : "index is invalid";
-//        return headerIndexBijection.indexToPosition(index) << HEADER_SHIFT;
         return bijectionStep(index, BIJECTION_STEP_FW) << HEADER_SHIFT;
     }
 
     public static long indexForHeaderPosition(final long position) {
         assert validHeaderPosition(position) : "header position is invalid";
-//        return headerIndexBijection.positionToIndex(position >>> HEADER_SHIFT);
         return bijectionStep(position >>> HEADER_SHIFT, BIJECTION_STEP_BW);
     }
 

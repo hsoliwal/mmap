@@ -23,48 +23,53 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.CloseHelper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.internal.Closeables;
+import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.queue.api.Index;
 import org.tools4j.mmap.queue.api.IndexReader;
-import org.tools4j.mmap.mapping.api.ElasticMapping;
 
 import static java.util.Objects.requireNonNull;
 
-final class IndexReaderImpl implements IndexReader {
-    private static final Logger LOGGER = LoggerFactory.getLogger(IndexReaderImpl.class);
+final class IndexReaderImpl implements IndexReader, Describable {
 
     private final String queueName;
-    private final ElasticMapping header;
+    private final ReaderMappings mappings;
     private final Runnable onClose;
+    private final LifecycleListener lifecycleListener;
 
-    IndexReaderImpl(final String queueName, final ElasticMapping header, final Runnable onClose) {
+    IndexReaderImpl(final String queueName, final ReaderMappings mappings, final Runnable onClose,
+                    final LifecycleListener lifecycleListener) {
         try {
             this.queueName = requireNonNull(queueName);
-            this.header = requireNonNull(header);
+            this.mappings = requireNonNull(mappings);
             this.onClose = requireNonNull(onClose);
+            this.lifecycleListener = requireNonNull(lifecycleListener);
         } catch (final Throwable t) {
-            CloseHelper.quietClose(header);
+            Closeables.closeOnFailure(mappings, t);
             throw t;
         }
+        lifecycleListener.onOpened(this);
     }
 
     @Override
     public long lastIndex() {
         checkNotClosed();
-        return Headers.binarySearchLastIndex(header, Index.FIRST);
+        final ElasticMapping header = mappings.header();
+        return header != null ? Headers.binarySearchLastIndex(header, Index.FIRST) : Index.NULL;
     }
 
     @Override
     public boolean hasEntry(final long index) {
         checkNotClosed();
-        return Headers.hasNonEmptyHeaderAt(header, index);
+        final ElasticMapping header = mappings.header();
+        return header != null && Headers.hasNonEmptyHeaderAt(header, index);
     }
 
     @Override
     public boolean isClosed() {
-        return header.isClosed();
+        return mappings.isClosed();
     }
 
     private void checkNotClosed() {
@@ -76,14 +81,21 @@ final class IndexReaderImpl implements IndexReader {
     @Override
     public void close() {
         if (!isClosed()) {
-            header.close();
+            mappings.close();
             onClose.run();
-            LOGGER.info("Index reader closed, queue={}", queueName);
+            lifecycleListener.onClosed(this);
         }
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("IndexReaderImpl")
+                .append(":queue=").append(queueName)
+                .append("|closed=").append(isClosed());
+    }
+
+    @Override
     public String toString() {
-        return "IndexReaderImpl:queue=" + queueName + "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 }

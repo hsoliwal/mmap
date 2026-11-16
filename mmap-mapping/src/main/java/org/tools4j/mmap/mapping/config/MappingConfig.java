@@ -23,7 +23,10 @@
  */
 package org.tools4j.mmap.mapping.config;
 
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
 import org.tools4j.mmap.mapping.api.DynamicMapping;
+import org.tools4j.mmap.mapping.api.FileInitialiser;
 import org.tools4j.mmap.mapping.api.Mappings;
 
 import static org.tools4j.mmap.mapping.impl.MappingConfigDefaults.MAPPING_CONFIG_DEFAULTS;
@@ -88,11 +91,35 @@ public interface MappingConfig {
     int filesToCreateAhead();
 
     /**
+     * Returns the file initialiser, providing the hook invoked before a file or its new space is accessed through a
+     * mapping, for instance {@link FileInitialiser#LAZY} leaving new file space sparse, or {@link FileInitialiser#ZERO}
+     * allocating it by writing zero bytes.
+     *
+     * @return the file initialiser
+     * @see MappingConfigurations#defaultFileInitialiser()
+     */
+    FileInitialiser fileInitialiser();
+
+    /**
      * Returns the mapping strategy to use.
      *
      * @return the mapping strategy to use
      */
     MappingStrategyConfig mappingStrategy();
+
+    /**
+     * Returns the listener for lifecycle events such as files created, opened and closed.
+     *
+     * @return the lifecycle listener
+     */
+    LifecycleListener lifecycleListener();
+
+    /**
+     * Returns the listener for errors that cannot be thrown to the caller, and for warnings.
+     *
+     * @return the error listener
+     */
+    ErrorListener errorListener();
 
     /**
      * Returns an immutable version of this mapping config.

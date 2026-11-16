@@ -23,6 +23,10 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.config.CoreConfigurations;
+import org.tools4j.mmap.mapping.api.FileInitialiser;
 import org.tools4j.mmap.mapping.config.MappingConfig;
 import org.tools4j.mmap.mapping.config.MappingConfigurations;
 import org.tools4j.mmap.mapping.config.MappingConfigurator;
@@ -32,13 +36,13 @@ import org.tools4j.mmap.mapping.config.MappingStrategyConfigurator;
 import java.util.function.Consumer;
 
 import static java.util.Objects.requireNonNull;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateFilesToCreateAhead;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxFileSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxOpenFiles;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMinFileSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
 import static org.tools4j.mmap.mapping.impl.MappingConfigDefaults.MAPPING_CONFIG_DEFAULTS;
 import static org.tools4j.mmap.mapping.impl.MappingStrategyConfigDefaults.MAPPING_STRATEGY_CONFIG_DEFAULTS;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateFilesToCreateAhead;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMaxFileSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMaxOpenFiles;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMinFileSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionSize;
 
 public class MappingConfiguratorImpl implements MappingConfigurator {
     protected final MappingConfig defaults;
@@ -49,7 +53,10 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
     protected Boolean rollFiles;
     protected int maxOpenFiles;
     protected int filesToCreateAhead;
+    protected FileInitialiser fileInitialiser;
     protected MappingStrategyConfig mappingStrategy;
+    protected LifecycleListener lifecycleListener;
+    protected ErrorListener errorListener;
 
     public MappingConfiguratorImpl() {
         this(MAPPING_CONFIG_DEFAULTS);
@@ -67,9 +74,12 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
         this.regionSize = 0;
         this.expandFile = null;
         this.rollFiles = null;
-        this.maxOpenFiles = -1;
+        this.maxOpenFiles = 0;
         this.filesToCreateAhead = -1;
+        this.fileInitialiser = null;
         this.mappingStrategy = null;
+        this.lifecycleListener = null;
+        this.errorListener = null;
         return this;
     }
 
@@ -129,10 +139,10 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
 
     @Override
     public int maxOpenFiles() {
-        if (maxOpenFiles < 0) {
+        if (maxOpenFiles <= 0) {
             maxOpenFiles = defaults.maxOpenFiles();
         }
-        if (maxOpenFiles < 0) {
+        if (maxOpenFiles <= 0) {
             maxOpenFiles = MappingConfigurations.defaultMaxOpenFiles();
         }
         return maxOpenFiles;
@@ -150,6 +160,17 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
     }
 
     @Override
+    public FileInitialiser fileInitialiser() {
+        if (fileInitialiser == null) {
+            fileInitialiser = defaults.fileInitialiser();
+        }
+        if (fileInitialiser == null) {
+            fileInitialiser = MappingConfigurations.defaultFileInitialiser();
+        }
+        return fileInitialiser;
+    }
+
+    @Override
     public MappingStrategyConfig mappingStrategy() {
         if (mappingStrategy == null) {
             mappingStrategy = defaults.mappingStrategy();
@@ -158,6 +179,28 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
             mappingStrategy = MAPPING_STRATEGY_CONFIG_DEFAULTS;
         }
         return mappingStrategy;
+    }
+
+    @Override
+    public LifecycleListener lifecycleListener() {
+        if (lifecycleListener == null) {
+            lifecycleListener = defaults.lifecycleListener();
+        }
+        if (lifecycleListener == null) {
+            lifecycleListener = MappingConfigurations.defaultLifecycleListener();
+        }
+        return lifecycleListener;
+    }
+
+    @Override
+    public ErrorListener errorListener() {
+        if (errorListener == null) {
+            errorListener = defaults.errorListener();
+        }
+        if (errorListener == null) {
+            errorListener = CoreConfigurations.defaultErrorListener();
+        }
+        return errorListener;
     }
 
     @Override
@@ -195,7 +238,9 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
 
     @Override
     public MappingConfigurator maxOpenFiles(final int maxOpenFiles) {
-        validateMaxOpenFiles(maxOpenFiles);
+        if (maxOpenFiles != 0) {
+            validateMaxOpenFiles(maxOpenFiles);
+        }
         this.maxOpenFiles = maxOpenFiles;
         return this;
     }
@@ -204,6 +249,12 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
     public MappingConfigurator filesToCreateAhead(final int filesToCreateAhead) {
         validateFilesToCreateAhead(filesToCreateAhead);
         this.filesToCreateAhead = filesToCreateAhead;
+        return this;
+    }
+
+    @Override
+    public MappingConfigurator fileInitialiser(final FileInitialiser fileInitialiser) {
+        this.fileInitialiser = requireNonNull(fileInitialiser);
         return this;
     }
 
@@ -221,6 +272,18 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
     }
 
     @Override
+    public MappingConfigurator lifecycleListener(final LifecycleListener lifecycleListener) {
+        this.lifecycleListener = requireNonNull(lifecycleListener);
+        return this;
+    }
+
+    @Override
+    public MappingConfigurator errorListener(final ErrorListener errorListener) {
+        this.errorListener = requireNonNull(errorListener);
+        return this;
+    }
+
+    @Override
     public String toString() {
         return "MappingConfiguratorImpl" +
                 ":minFileSize=" + minFileSize +
@@ -230,7 +293,10 @@ public class MappingConfiguratorImpl implements MappingConfigurator {
                 "|rollFiles=" + rollFiles +
                 "|maxOpenFiles=" + maxOpenFiles +
                 "|filesToCreateAhead=" + filesToCreateAhead +
+                "|fileInitialiser=" + fileInitialiser +
                 "|mappingStrategy=" + mappingStrategy +
+                "|lifecycleListener=" + lifecycleListener +
+                "|errorListener=" + errorListener +
                 "|defaults=" + defaults;
     }
 }

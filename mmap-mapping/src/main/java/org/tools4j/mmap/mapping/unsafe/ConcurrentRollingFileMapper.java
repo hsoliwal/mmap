@@ -23,15 +23,18 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.concurrent.AtomicArray;
+import org.tools4j.mmap.core.config.CoreConfigurations;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.FileInitialiser;
-import org.tools4j.mmap.mapping.api.Unsafe;
 import org.tools4j.mmap.mapping.config.MappingConfig;
-import org.tools4j.mmap.mapping.impl.AtomicArray;
-import org.tools4j.mmap.mapping.impl.RollingFiles;
+import org.tools4j.mmap.mapping.config.MappingConfigurations;
 import org.tools4j.mmap.mapping.impl.ConcurrentLruCache;
+import org.tools4j.mmap.mapping.impl.RollingFiles;
 
 import java.io.File;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -39,13 +42,13 @@ import java.util.function.Function;
 import java.util.function.IntFunction;
 
 import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.Validations.alreadyClosedException;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
-import static org.tools4j.mmap.mapping.impl.Constraints.alreadyClosedException;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateFilesToCreateAhead;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxFileSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxOpenFiles;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateFilesToCreateAhead;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMaxFileSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMaxOpenFiles;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionSize;
 
 /**
  * Splits a logical stream across multiple physical files ("rolling"), creating a new file once the current one reaches
@@ -60,8 +63,7 @@ import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
  * its own resources. See {@link RollingFileMapper} for a single-threaded alternative.
  */
 @Unsafe
-public final class ConcurrentRollingFileMapper {
-    private static final Logger LOGGER = LoggerFactory.getLogger(ConcurrentRollingFileMapper.class);
+public final class ConcurrentRollingFileMapper implements Describable {
     private static final int DEFAULT_CAPACITY = 1024;
 
     private final File baseFile;
@@ -71,6 +73,8 @@ public final class ConcurrentRollingFileMapper {
     private final int filesToCreateAhead;
     private final int maxOpenFiles;
     private final AccessMode accessMode;
+    private final LifecycleListener lifecycleListener;
+    private final ErrorListener errorListener;
     private final long positionInFileMask;
     private final int positionToFileIndexShift;
 
@@ -87,7 +91,9 @@ public final class ConcurrentRollingFileMapper {
                                         final int regionSize,
                                         final int filesToCreateAhead,
                                         final int maxOpenFiles,
-                                        final AccessMode accessMode) {
+                                        final AccessMode accessMode,
+                                        final LifecycleListener lifecycleListener,
+                                        final ErrorListener errorListener) {
         requireNonNull(baseFile);
         requireNonNull(fileMapperFactory);
         validateMaxFileSize(maxFileSize);
@@ -114,17 +120,19 @@ public final class ConcurrentRollingFileMapper {
         this.filesToCreateAhead = filesToCreateAhead;
         this.maxOpenFiles = maxOpenFiles;
         this.accessMode = accessMode;
+        this.lifecycleListener = requireNonNull(lifecycleListener);
+        this.errorListener = requireNonNull(errorListener);
         this.positionInFileMask = maxFileSize - 1;
         this.positionToFileIndexShift = Long.SIZE - Long.numberOfLeadingZeros(maxFileSize - 1);
         this.files = new AtomicArray<>(DEFAULT_CAPACITY);
         this.fileMappers = new ConcurrentLruCache<>(maxOpenFiles);
+        lifecycleListener.onOpened(this);
     }
 
     public static FileMapper forReadOnly(final File baseFile,
-                                         final MappingConfig config,
-                                         final FileInitialiser fileInitialiser) {
+                                         final MappingConfig config) {
         return forReadOnly(baseFile, config.maxFileSize(), config.regionSize(), config.maxOpenFiles(),
-                fileInitialiser);
+                config.fileInitialiser(), config.lifecycleListener(), config.errorListener());
     }
 
     public static FileMapper forReadOnly(final File baseFile,
@@ -132,18 +140,31 @@ public final class ConcurrentRollingFileMapper {
                                          final int regionSize,
                                          final int maxOpenFiles,
                                          final FileInitialiser fileInitialiser) {
+        return forReadOnly(baseFile, maxFileSize, regionSize, maxOpenFiles, fileInitialiser,
+                MappingConfigurations.defaultLifecycleListener(), CoreConfigurations.defaultErrorListener());
+    }
+
+    public static FileMapper forReadOnly(final File baseFile,
+                                         final long maxFileSize,
+                                         final int regionSize,
+                                         final int maxOpenFiles,
+                                         final FileInitialiser fileInitialiser,
+                                         final LifecycleListener lifecycleListener,
+                                         final ErrorListener errorListener) {
         requireNonNull(fileInitialiser);
-        return new ConcurrentRollingFileMapper(baseFile, file -> new ReadOnlyFileMapper(file, fileInitialiser),
-                maxFileSize, regionSize, 0, maxOpenFiles, AccessMode.READ_ONLY).newOwnerMapper();
+        requireNonNull(lifecycleListener);
+        requireNonNull(errorListener);
+        return new ConcurrentRollingFileMapper(baseFile,
+                file -> new ReadOnlyFileMapper(file, fileInitialiser, lifecycleListener, errorListener),
+                maxFileSize, regionSize, 0, maxOpenFiles, AccessMode.READ_ONLY, lifecycleListener, errorListener).newOwnerMapper();
     }
 
     public static FileMapper forReadWrite(final File baseFile,
                                           final AccessMode accessMode,
-                                          final MappingConfig config,
-                                          final FileInitialiser fileInitialiser) {
+                                          final MappingConfig config) {
         return forReadWrite(baseFile, accessMode, config.expandFile(), config.minFileSize(), config.maxFileSize(),
                 config.regionSize(), config.filesToCreateAhead(), config.maxOpenFiles(),
-                fileInitialiser);
+                config.fileInitialiser(), config.lifecycleListener(), config.errorListener());
     }
 
     public static FileMapper forReadWrite(final File baseFile,
@@ -155,13 +176,33 @@ public final class ConcurrentRollingFileMapper {
                                           final int filesToCreateAhead,
                                           final int maxOpenFiles,
                                           final FileInitialiser fileInitialiser) {
+        return forReadWrite(baseFile, accessMode, expandFile, minFileSize, maxFileSize, regionSize,
+                filesToCreateAhead, maxOpenFiles, fileInitialiser, MappingConfigurations.defaultLifecycleListener(),
+                CoreConfigurations.defaultErrorListener());
+    }
+
+    public static FileMapper forReadWrite(final File baseFile,
+                                          final AccessMode accessMode,
+                                          final boolean expandFile,
+                                          final long minFileSize,
+                                          final long maxFileSize,
+                                          final int regionSize,
+                                          final int filesToCreateAhead,
+                                          final int maxOpenFiles,
+                                          final FileInitialiser fileInitialiser,
+                                          final LifecycleListener lifecycleListener,
+                                          final ErrorListener errorListener) {
         requireNonNull(accessMode);
         requireNonNull(fileInitialiser);
+        requireNonNull(lifecycleListener);
+        requireNonNull(errorListener);
         final Function<File, FileMapper> fileMapperFactory = expandFile ?
-                file -> new ExpandableSizeFileMapper(file, minFileSize, maxFileSize, regionSize, fileInitialiser) :
-                file -> new FixedSizeFileMapper(file, maxFileSize, accessMode, fileInitialiser);
+                file -> new ExpandableSizeFileMapper(file, minFileSize, maxFileSize, regionSize, fileInitialiser,
+                        lifecycleListener, errorListener) :
+                file -> new FixedSizeFileMapper(file, maxFileSize, accessMode, fileInitialiser, lifecycleListener,
+                        errorListener);
         return new ConcurrentRollingFileMapper(baseFile, fileMapperFactory, maxFileSize, regionSize, filesToCreateAhead,
-                maxOpenFiles, accessMode).newOwnerMapper();
+                maxOpenFiles, accessMode, lifecycleListener, errorListener).newOwnerMapper();
     }
 
     private PerThreadFileMapper newOwnerMapper() {
@@ -205,30 +246,34 @@ public final class ConcurrentRollingFileMapper {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
-        final int openBeforeClosing = openFiles();
         try {
             if (!fileMappers.removeAll()) {
-                LOGGER.warn("Some files were still in use when closing {}", this);
+                errorListener.onWarning(this, "Some files were still in use when closing");
             }
             for (int i = 0, len = files.length(); i < len; i++) {
                 files.setIfPresent(i, null);
             }
         } finally {
-            LOGGER.info("Closed: {} ({} open files before closing)", this, openBeforeClosing);
+            lifecycleListener.onClosed(this);
         }
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("ConcurrentRollingFileMapper")
+                .append(":baseFile=").append(baseFile.getPath())
+                .append("|accessMode=").append(accessMode)
+                .append("|maxFileSize=").append(maxFileSize)
+                .append("|regionSize=").append(regionSize)
+                .append("|filesToCreateAhead=").append(filesToCreateAhead)
+                .append("|maxOpenFiles=").append(maxOpenFiles)
+                .append("|openFiles=").append(openFiles())
+                .append("|closed=").append(closed.getAcquire());
+    }
+
+    @Override
     public String toString() {
-        return "ConcurrentRollingFileMapper" +
-                ":accessMode=" + accessMode +
-                "|maxFileSize=" + maxFileSize +
-                "|regionSize=" + regionSize +
-                "|filesToCreateAhead=" + filesToCreateAhead +
-                "|maxOpenFiles=" + maxOpenFiles +
-                "|baseFile=" + baseFile +
-                "|openFiles=" + openFiles() +
-                "|closed=" + closed.getAcquire();
+        return Describable.describe(this);
     }
 
     /**
@@ -269,7 +314,7 @@ public final class ConcurrentRollingFileMapper {
         }
 
         @Override
-        public long map(final long position, final int length) {
+        public long map(final long position, final int length, final boolean preTouch) {
             if (position < 0) {
                 return NULL_ADDRESS;
             }
@@ -293,7 +338,7 @@ public final class ConcurrentRollingFileMapper {
                 mapperForIndex = borrower.acquire(fileIndex, fileMapperByIndexFactory);
             }
             try {
-                return mapperForIndex.map(position & positionInFileMask, length);
+                return mapperForIndex.map(position & positionInFileMask, length, preTouch);
             } finally {
                 borrower.release();
             }

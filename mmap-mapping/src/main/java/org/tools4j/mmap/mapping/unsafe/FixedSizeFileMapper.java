@@ -23,19 +23,22 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.config.CoreConfigurations;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.FileInitialiser;
-import org.tools4j.mmap.mapping.api.Unsafe;
+import org.tools4j.mmap.mapping.config.MappingConfigurations;
 
 import java.io.File;
 import java.nio.channels.FileChannel;
 
 import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.Validations.validateNotClosed;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
 
 /**
  * A {@link FileMapper} for a file of fixed, pre-allocated size.
@@ -44,23 +47,33 @@ import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
  * multiple threads.
  */
 @Unsafe
-public class FixedSizeFileMapper implements FileMapper {
-    private static final Logger LOGGER = LoggerFactory.getLogger(FixedSizeFileMapper.class);
+public class FixedSizeFileMapper implements FileMapper, Describable {
     private final File file;
     private final long fileSize;
     private final AccessMode accessMode;
     private final FileChannelProvider fileChannelProvider;
-    private final PreTouchHelper preTouchHelper;
+    private final PreToucher preToucher;
 
     public FixedSizeFileMapper(final File file, 
                                final long fileSize, 
                                final AccessMode accessMode,
                                final FileInitialiser fileInitialiser) {
+        this(file, fileSize, accessMode, fileInitialiser, MappingConfigurations.defaultLifecycleListener(),
+                CoreConfigurations.defaultErrorListener());
+    }
+
+    public FixedSizeFileMapper(final File file,
+                               final long fileSize,
+                               final AccessMode accessMode,
+                               final FileInitialiser fileInitialiser,
+                               final LifecycleListener lifecycleListener,
+                               final ErrorListener errorListener) {
         this.file = requireNonNull(file);
         this.fileSize = fileSize;
         this.accessMode = requireNonNull(accessMode);
-        this.preTouchHelper = new PreTouchHelper(accessMode);
-        this.fileChannelProvider = new FileChannelProvider(this, file, fileInitialiser, fileSize);
+        this.preToucher = new PreToucher();
+        this.fileChannelProvider = new FileChannelProvider(this, accessMode, file, fileInitialiser, fileSize,
+                lifecycleListener, errorListener);
         init();
     }
 
@@ -83,7 +96,7 @@ public class FixedSizeFileMapper implements FileMapper {
     }
 
     @Override
-    public long map(final long position, final int length) {
+    public long map(final long position, final int length, final boolean preTouch) {
         assert position >= 0;
         assert length >= 0;
         if (position + length > fileSize) {
@@ -96,7 +109,9 @@ public class FixedSizeFileMapper implements FileMapper {
             throw new IllegalStateException("Failed to open file channel for file " + file);
         }
         final long address = FileChannels.map(channel, accessMode.mapMode(), position, length);
-        preTouchHelper.preTouch(position, length, address);
+        if (preTouch && accessMode != AccessMode.READ_ONLY) {//pre-touching writes, which a read-only mapping must not
+            preToucher.preTouch(position, length, address);
+        }
         return address;
     }
 
@@ -109,10 +124,7 @@ public class FixedSizeFileMapper implements FileMapper {
     }
 
     private void init() {
-        final FileChannel channel = fileChannelProvider.get();
-        if (channel == null) {
-            LOGGER.error("Failed to open file channel for file {}", file);
-        }
+        fileChannelProvider.get();
     }
 
     public boolean isClosed() {
@@ -121,17 +133,20 @@ public class FixedSizeFileMapper implements FileMapper {
 
     @Override
     public void close() {
-        if (fileChannelProvider.closeIfNeeded()) {
-            LOGGER.info("Closed: {}", this);
-        }
+        fileChannelProvider.closeIfNeeded();
+    }
+
+    @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("FixedSizeFileMapper")
+                .append(":file=").append(file.getPath())
+                .append("|fileSize=").append(fileSize)
+                .append("|accessMode=").append(accessMode)
+                .append("|closed=").append(isClosed());
     }
 
     @Override
     public String toString() {
-        return "FixedSizeFileMapper" +
-                ":fileSize=" + fileSize +
-                "|accessMode=" + accessMode +
-                "|file=" + file +
-                "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 }

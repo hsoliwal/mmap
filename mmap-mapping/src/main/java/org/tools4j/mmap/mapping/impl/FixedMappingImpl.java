@@ -23,20 +23,22 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
-import org.agrona.CloseHelper;
-import org.agrona.concurrent.AtomicBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBufferFlyweight;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
+import org.tools4j.mmap.core.internal.Closeables;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.FixedMapping;
 import org.tools4j.mmap.mapping.unsafe.FileMapper;
 import org.tools4j.mmap.mapping.unsafe.FixedSizeFileMapper;
 
 import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.Validations.validateNonNegative;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
 import static org.tools4j.mmap.mapping.impl.Constants.REGION_SIZE_GRANULARITY;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateFixedMappingLength;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateNonNegative;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateFixedMappingLength;
 
 public class FixedMappingImpl implements FixedMapping {
     private final FileMapper fileMapper;
@@ -44,21 +46,25 @@ public class FixedMappingImpl implements FixedMapping {
     private final int fileSize;
     /** File mappings must start at a granularity aligned position, the buffer starts pageOffset bytes later */
     private final int pageOffset;
-    private final UnsafeBuffer buffer;
+    private final MemoryBufferFlyweight buffer = MemoryBuffers.flyweight();
     private long mappedPosition;
 
+    @Unsafe
     public FixedMappingImpl(final FixedSizeFileMapper fileMapper) {
         this(fileMapper, 0L);
     }
 
+    @Unsafe
     public FixedMappingImpl(final FixedSizeFileMapper fileMapper, final long offset) {
         this(fileMapper, offset, mappingLength(fileMapper, offset), true);
     }
 
+    @Unsafe
     public FixedMappingImpl(final FileMapper fileMapper, final long offset, final int length) {
         this(fileMapper, offset, length, true);
     }
 
+    @Unsafe
     public FixedMappingImpl(final FileMapper fileMapper,
                             final long offset,
                             final int length,
@@ -76,11 +82,14 @@ public class FixedMappingImpl implements FixedMapping {
                         "to granularity " + REGION_SIZE_GRANULARITY + " for offset " + offset);
             }
             final long pageAddress = map(fileMapper, offset - pageOffset, length + pageOffset);
-            this.buffer = new UnsafeBuffer(pageAddress + pageOffset, length);
+            buffer.wrap(pageAddress + pageOffset, length);
+            if (fileMapper.accessMode() == AccessMode.READ_ONLY) {
+                buffer.makeReadOnly();
+            }
             this.mappedPosition = offset;
         } catch (final Throwable t) {
             if (closeFileMapperOnClose) {
-                CloseHelper.quietClose(fileMapper);
+                Closeables.closeOnFailure(fileMapper, t);
             }
             throw t;
         }
@@ -93,13 +102,14 @@ public class FixedMappingImpl implements FixedMapping {
             validateFixedMappingLength(offset, fileSize);
             return (int) (fileSize - offset);
         } catch (final Throwable t) {
-            CloseHelper.quietClose(fileMapper);
+            Closeables.closeOnFailure(fileMapper, t);
             throw t;
         }
     }
 
     private static long map(final FileMapper fileMapper, final long position, final int length) {
-        final long address = fileMapper.map(position, length);
+        //NOTE: no pre-touch, the mapping is used by the thread creating it
+        final long address = fileMapper.map(position, length, false);
         if (address != NULL_ADDRESS) {
             return address;
         }
@@ -131,7 +141,7 @@ public class FixedMappingImpl implements FixedMapping {
 
     @Override
     public long address() {
-        return buffer.addressOffset();
+        return buffer.address();
     }
 
     @Override
@@ -145,7 +155,7 @@ public class FixedMappingImpl implements FixedMapping {
     }
 
     @Override
-    public AtomicBuffer buffer() {
+    public MutableMemoryBuffer buffer() {
         return buffer;
     }
 
@@ -155,7 +165,7 @@ public class FixedMappingImpl implements FixedMapping {
         if (position != NULL_POSITION) {
             mappedPosition = NULL_POSITION;
             final long address = address();
-            buffer.wrap(0, 0);
+            buffer.unwrap();
             unmap(fileMapper, position - pageOffset, address - pageOffset, fileSize + pageOffset);
             if (closeFileMapperOnClose) {
                 fileMapper.close();

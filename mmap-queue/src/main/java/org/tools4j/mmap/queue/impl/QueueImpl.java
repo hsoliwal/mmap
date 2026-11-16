@@ -23,14 +23,13 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.CloseHelper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Closeable;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.internal.Closeables;
 import org.tools4j.mmap.mapping.api.AccessMode;
-import org.tools4j.mmap.mapping.api.Closeable;
 import org.tools4j.mmap.mapping.api.OpenMode;
-import org.tools4j.mmap.mapping.impl.IdPool;
-import org.tools4j.mmap.mapping.impl.IdPool256;
 import org.tools4j.mmap.queue.api.Appender;
 import org.tools4j.mmap.queue.api.EntryIterator;
 import org.tools4j.mmap.queue.api.EntryReader;
@@ -56,11 +55,11 @@ import static java.util.Objects.requireNonNull;
  * multiple reading threads, when each thread creates their own instances of
  * {@link #createAppender() appender}, {@link #createPoller() poller} etc.
  */
-public final class QueueImpl implements Queue {
-    private static final Logger LOGGER = LoggerFactory.getLogger(QueueImpl.class);
-
+public final class QueueImpl implements Queue, Describable {
     private final QueueFiles files;
     private final QueueConfig config;
+    private final LifecycleListener lifecycleListener;
+    private final ErrorListener errorListener;
     /** Config in effect, with the queue layout from the meta file; null until the queue exists (lazy read-only only) */
     private final AtomicReference<QueueConfig> effectiveConfig;
     private final Factory<ReaderConfig, Poller> pollerFactory;
@@ -69,35 +68,42 @@ public final class QueueImpl implements Queue {
     private final Factory<IndexReaderConfig, IndexReader> indexReaderFactory;
     private final Factory<AppenderConfig, Appender> appenderFactory;
     /** ID pool of appenders, null in read-only mode; closed last, after appenders have released their IDs */
-    private final IdPool idPool;
+    private final AppenderIdPool idPool;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final java.util.Queue<Registration> registrations = new ConcurrentLinkedQueue<>();
 
     public QueueImpl(final File file, final OpenMode openMode, final QueueConfig queueConfig) {
         this.files = new QueueFiles(file);
         this.config = queueConfig.toImmutableQueueConfig();
+        this.lifecycleListener = config.lifecycleListener();
+        this.errorListener = config.errorListener();
         this.effectiveConfig = new AtomicReference<>(openQueue(openMode));
 
         final Supplier<QueueConfig> effectiveConfigSupplier = this::effectiveConfig;
         this.pollerFactory = factory((pollerConfig, onClose) -> new PollerImpl(
                 queueNameIfNotClosed(),
-                ReaderMappings.create(files, effectiveConfigSupplier, pollerConfig),
-                onClose
+                ReaderMappings.create(files, openMode, effectiveConfigSupplier, pollerConfig),
+                onClose,
+                lifecycleListener,
+                errorListener
         ));
         this.entryReaderFactory = factory((readerConfig, onClose) -> new EntryReaderImpl(
                 queueNameIfNotClosed(),
-                ReaderMappings.create(files, effectiveConfigSupplier, readerConfig),
-                onClose
+                ReaderMappings.create(files, openMode, effectiveConfigSupplier, readerConfig),
+                onClose,
+                lifecycleListener
         ));
         this.entryIteratorFactory = factory((readerConfig, onClose) -> new EntryIteratorImpl(
                 queueNameIfNotClosed(),
-                ReaderMappings.create(files, effectiveConfigSupplier, readerConfig),
-                onClose
+                ReaderMappings.create(files, openMode, effectiveConfigSupplier, readerConfig),
+                onClose,
+                lifecycleListener
         ));
         this.indexReaderFactory = factory((indReaderConfig, onClose) -> new IndexReaderImpl(
                 queueNameIfNotClosed(),
-                IndexMappings.create(files, effectiveConfigSupplier, indReaderConfig),
-                onClose
+                ReaderMappings.create(files, openMode, effectiveConfigSupplier, indReaderConfig),
+                onClose,
+                lifecycleListener
         ));
         if (openMode.accessMode() == AccessMode.READ_ONLY) {
             this.idPool = null;
@@ -107,14 +113,17 @@ public final class QueueImpl implements Queue {
             };
         } else {
             final QueueConfig writerConfig = effectiveConfig.get();
-            final IdPool pool = new IdPool256(files.idPoolFile(), writerConfig.maxAppenders());
+            final AppenderIdPool pool = new AppenderIdPool(files.idPoolFile(), writerConfig.maxAppenders(), lifecycleListener,
+                    errorListener);
             this.idPool = pool;
             this.appenderFactory = factory((appenderConfig, onClose) -> new AppenderImpl(
                     queueNameIfNotClosed(),
                     AppenderMappings.create(files, pool, writerConfig, appenderConfig),
-                    onClose
+                    onClose,
+                    lifecycleListener
             ));
         }
+        lifecycleListener.onOpened(this);
     }
 
     /**
@@ -171,7 +180,7 @@ public final class QueueImpl implements Queue {
     private void warnIfDifferent(final QueueLayoutConfig layout) {
         final CharSequence differences = QueueLayoutConfigs.diff(layout, config);
         if (differences != null) {
-            LOGGER.warn("Queue {} was created with a different layout, using: {}", files.queueName(), differences);
+            errorListener.onWarning(this, "Queue was created with a different layout, using: " + differences);
         }
     }
 
@@ -223,8 +232,9 @@ public final class QueueImpl implements Queue {
             //      as both register-then-check and set-closed-then-close use volatile accesses, at least one of us
             //      closes it
             if (isClosed()) {
-                CloseHelper.quietClose(closeable);
-                throw queueClosedException();
+                final IllegalStateException closedException = queueClosedException();
+                Closeables.closeOnFailure(closeable, closedException);
+                throw closedException;
             }
             return closeable;
         };
@@ -309,18 +319,32 @@ public final class QueueImpl implements Queue {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             for (final Registration registration : registrations) {
-                CloseHelper.quietClose(registration.closeable);
+                closeReportingError(registration.closeable);
             }
             registrations.clear();
-            CloseHelper.quietClose(idPool);
-            LOGGER.info("Closed queue: {}", files.queueName());
+            closeReportingError(idPool);
+            lifecycleListener.onClosed(this);
+        }
+    }
+
+    /** Closes a resource of this queue, reporting an error rather than skipping the resources still to close */
+    private void closeReportingError(final Closeable resource) {
+        try {
+            resource.close();
+        } catch (final RuntimeException e) {
+            errorListener.onError(this, "Closing a queue resource failed", e);
         }
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("QueueImpl")
+                .append(":queue=").append(files.queueName())
+                .append("|closed=").append(isClosed());
+    }
+
+    @Override
     public String toString() {
-        return "QueueImpl" +
-                ":queue=" + files.queueName() +
-                "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 }

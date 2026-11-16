@@ -1,0 +1,211 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2016-2026 tools4j.org (Marco Terzer, Anton Anufriev)
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package org.tools4j.mmap.mapping.impl;
+
+import org.tools4j.mmap.mapping.api.RegionMetrics;
+
+import static org.tools4j.mmap.core.internal.PowersOfTwo.isPowerOfTwo;
+import static org.tools4j.mmap.core.internal.Validations.validateGreaterThanZero;
+import static org.tools4j.mmap.core.internal.Validations.validateNonNegative;
+import static org.tools4j.mmap.core.internal.Validations.validatePowerOfTwo;
+import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
+import static org.tools4j.mmap.mapping.impl.Constants.REGION_SIZE_GRANULARITY;
+
+public enum MappingValidations {
+    ;
+
+    public static void validateAddress(final long address) {
+        if (address <= NULL_ADDRESS) {
+            throw new IllegalArgumentException("Invalid address " + address);
+        }
+    }
+
+    public static void validatePositionState(final long position) {
+        if (position < 0) {
+            throw new IllegalStateException("Invalid current position");
+        }
+    }
+
+    public static void validatePosition(final long position) {
+        if (position < 0) {
+            throw new IllegalArgumentException("Position cannot be negative, but was " + position);
+        }
+    }
+
+    public static void validatePosition(final long position, final long positionStepSize) {
+        assert isPowerOfTwo(positionStepSize);
+        if (position < 0 || 0 != (position & (positionStepSize - 1))) {
+            throw new IllegalArgumentException("Invalid position " + position +
+                    " for mapping with position step size " + positionStepSize);
+        }
+    }
+
+    public static void validateRegionPosition(final long position, final RegionMetrics regionMetrics) {
+        validateRegionPosition(position, regionMetrics.regionSize());
+    }
+
+    public static void validateRegionPosition(final long position, final int regionSize) {
+        assert isPowerOfTwo(regionSize);
+        if (position < 0 || 0 != (position & (regionSize - 1))) {
+            throw new IllegalArgumentException("Invalid region position " + position + " for region size " + regionSize);
+        }
+    }
+
+    public static void validateRegionOffset(final int offset, final RegionMetrics regionMetrics) {
+        validateRegionOffset(offset, regionMetrics.regionSize());
+    }
+
+    public static void validateRegionOffset(final int offset, final int regionSize) {
+        if (offset < 0 || offset >= regionSize) {
+            throw new IllegalArgumentException("Invalid region offset " + offset + " for region size " + regionSize);
+        }
+    }
+
+    public static void validatePositionDelta(final long position, final long delta) {
+        assert position >= 0;
+        if (position + delta < 0) {
+            throw new IllegalArgumentException("Invalid position delta " + delta + " from start position " + position);
+        }
+    }
+
+    public static void validatePositionDelta(final long position, final long delta, final long positionStepSize) {
+        assert position >= 0;
+        assert isPowerOfTwo(positionStepSize);
+        final long pos = position + delta;
+        if (pos < 0 || 0 != (pos & (positionStepSize - 1))) {
+            throw new IllegalArgumentException("Invalid position delta " + delta + " from start position " + position +
+                    " for mapping with position step size " + positionStepSize);
+        }
+    }
+
+    public static void validateLimit(final long position, final long limit, final int maxLength) {
+        if (position > limit || (limit - position) > maxLength) {
+            throw new IllegalArgumentException("Invalid limit " + limit + " for position " + position +
+                    " and adaptive mapping with max-length " + maxLength);
+        }
+    }
+
+    public static void validateFixedMappingLength(final long offset, final long fileSize) {
+        if (fileSize - offset > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Mapping length exceeds integer limit for offset " + offset +
+                    " and file size " + fileSize);
+        }
+    }
+    public static void validateAdaptiveMappingLength(final int length, final int maxLength) {
+        if (length < 0 || length > maxLength) {
+            throw new IllegalArgumentException("Invalid length " + length + " for adaptive mapping with max-length " +
+                    maxLength);
+        }
+    }
+
+    public static void validateRegionSize(final int regionSize) {
+        if (!isPowerOfTwo(regionSize) || regionSize % REGION_SIZE_GRANULARITY != 0) {
+            throw new IllegalArgumentException("Region size must be a power of two and a multiple of " +
+                    REGION_SIZE_GRANULARITY + " but was " + regionSize);
+        }
+    }
+
+    public static void validateInitialPoolSize(final int initialPoolSize) {
+        validateNonNegative("Initial pool size", initialPoolSize);
+    }
+
+    public static void validateMinFileSize(final long minFileSize) {
+        if (minFileSize != 0 && (!isPowerOfTwo(minFileSize) || minFileSize % REGION_SIZE_GRANULARITY != 0)) {
+            throw new IllegalArgumentException("Min file size must be zero or a power of two and a multiple of " +
+                    REGION_SIZE_GRANULARITY + " but was " + minFileSize);
+        }
+    }
+
+    public static void validateMaxFileSize(final long maxFileSize) {
+        if (!isPowerOfTwo(maxFileSize) || maxFileSize % REGION_SIZE_GRANULARITY != 0) {
+            throw new IllegalArgumentException("Max file size must be a power of two and a multiple of " +
+                    REGION_SIZE_GRANULARITY + " but was " + maxFileSize);
+        }
+    }
+
+    /**
+     * Validates file sizes relative to each other and to region size; all sizes are expected to be valid individually,
+     * hence powers of two, so that "at least" implies "a multiple of".
+     */
+    public static void validateFileSizes(final long minFileSize,
+                                         final long maxFileSize,
+                                         final boolean expandFile,
+                                         final int regionSize) {
+        if (maxFileSize < regionSize) {
+            throw new IllegalArgumentException("Max file size " + maxFileSize +
+                    " must be a multiple of region size " + regionSize);
+        }
+        if (expandFile && minFileSize != 0) {
+            if (minFileSize < regionSize) {
+                throw new IllegalArgumentException("Min file size " + minFileSize +
+                        " must be zero or a multiple of region size " + regionSize);
+            }
+            if (minFileSize > maxFileSize) {
+                throw new IllegalArgumentException("Max file size " + maxFileSize +
+                        " must be a multiple of min file size " + minFileSize);
+            }
+        }
+    }
+
+    public static void validateFileSizeIncrement(final long fileSizeIncrement) {
+        if (!isPowerOfTwo(fileSizeIncrement) || fileSizeIncrement % REGION_SIZE_GRANULARITY != 0) {
+            throw new IllegalArgumentException("File size increment must be a power of two and a multiple of " +
+                    REGION_SIZE_GRANULARITY + " but was " + fileSizeIncrement);
+        }
+    }
+
+    public static void validateMaxOpenFiles(final int maxOpenFiles) {
+        if (maxOpenFiles <= 0) {
+            throw new IllegalArgumentException("Max open files must be at least one but was " +  maxOpenFiles);
+        }
+    }
+
+    public static void validateRegionCacheSize(final int cacheSize) {
+        validatePowerOfTwo("Region cache size", cacheSize);
+    }
+
+    public static void validateRegionLruCacheSize(final int cacheSize) {
+        validateNonNegative("Region LRU cache size", cacheSize);
+    }
+
+    public static void validateRegionsToMapAhead(final int regionsToMapAhead) {
+        validateGreaterThanZero("Regions to map ahead", regionsToMapAhead);
+    }
+
+    public static void validateAheadMappingCacheSize(final int aheadMappingCacheSize) {
+        validateNonNegative("Ahead-mapping cache size", aheadMappingCacheSize);
+        if (aheadMappingCacheSize > 0) {
+            validatePowerOfTwo("Ahead-mapping cache size", aheadMappingCacheSize);
+        }
+    }
+
+    public static void validateUnmappingCacheSize(final int cacheSize) {
+        validatePowerOfTwo("Unmapping cache size", cacheSize);
+    }
+
+    public static void validateFilesToCreateAhead(final int filesToCreateAhead) {
+        validateNonNegative("Files to create ahead", filesToCreateAhead);
+    }
+
+}

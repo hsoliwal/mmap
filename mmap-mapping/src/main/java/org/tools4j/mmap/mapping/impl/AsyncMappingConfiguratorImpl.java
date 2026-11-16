@@ -23,23 +23,25 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
-import org.agrona.concurrent.IdleStrategy;
+import org.tools4j.mmap.core.idle.Idler;
 import org.tools4j.mmap.mapping.api.AsyncRuntime;
 import org.tools4j.mmap.mapping.api.AsyncRuntimeInstances;
 import org.tools4j.mmap.mapping.config.AsyncMappingConfig;
 import org.tools4j.mmap.mapping.config.AsyncMappingConfigurator;
 import org.tools4j.mmap.mapping.config.SharingPolicy;
 
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ThreadFactory;
 import java.util.function.Supplier;
 
 import static java.util.Objects.requireNonNull;
 import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultAheadMappingCacheSize;
+import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultMappingRuntimeIdlerSupplier;
 import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultMappingRuntimeSupplier;
+import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultMappingRuntimeThreadFactory;
 import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultRegionsToMapAhead;
 import static org.tools4j.mmap.mapping.impl.AsyncMappingConfigDefaults.ASYNC_MAPPING_CONFIG_DEFAULTS;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateAheadMappingCacheSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionsToMapAhead;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateAheadMappingCacheSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionsToMapAhead;
 
 public class AsyncMappingConfiguratorImpl implements AsyncMappingConfigurator {
 
@@ -47,7 +49,9 @@ public class AsyncMappingConfiguratorImpl implements AsyncMappingConfigurator {
     private int regionsToMapAhead;
     private int aheadMappingCacheSize;
     private Supplier<? extends AsyncRuntime> mappingRuntimeSupplier;
-    private static final AtomicInteger mapperCounter = new AtomicInteger();
+    //set only by mappingRuntimeUsing(..), combined into the runtime supplier, null for the system default
+    private Supplier<? extends Idler> newRuntimeIdler;
+    private ThreadFactory newRuntimeThreadFactory;
 
     public AsyncMappingConfiguratorImpl() {
         this(ASYNC_MAPPING_CONFIG_DEFAULTS);
@@ -63,6 +67,8 @@ public class AsyncMappingConfiguratorImpl implements AsyncMappingConfigurator {
         regionsToMapAhead = 0;
         aheadMappingCacheSize = -1;
         mappingRuntimeSupplier = null;
+        newRuntimeIdler = null;
+        newRuntimeThreadFactory = null;
         return this;
     }
 
@@ -127,20 +133,35 @@ public class AsyncMappingConfiguratorImpl implements AsyncMappingConfigurator {
     @Override
     public AsyncMappingConfigurator mappingRuntimeSupplier(final Supplier<? extends AsyncRuntime> mappingRuntimeSupplier) {
         this.mappingRuntimeSupplier = requireNonNull(mappingRuntimeSupplier);
+        newRuntimeIdler = null;
+        newRuntimeThreadFactory = null;
         return this;
     }
 
     @Override
-    public AsyncMappingConfigurator mappingRuntimeUsing(final IdleStrategy idleStrategy) {
-        requireNonNull(idleStrategy);
-        return mappingRuntimeUsing(() -> idleStrategy);
+    public AsyncMappingConfigurator mappingRuntimeUsing(final Idler idler) {
+        requireNonNull(idler);
+        return mappingRuntimeUsing(() -> idler);
     }
 
     @Override
-    public AsyncMappingConfigurator mappingRuntimeUsing(final Supplier<? extends IdleStrategy> idleStrategy) {
-        requireNonNull(idleStrategy);
-        return mappingRuntimeSupplier(() -> AsyncRuntime.create(
-                "mapper-" + mapperCounter.incrementAndGet(), idleStrategy.get(), true));
+    public AsyncMappingConfigurator mappingRuntimeUsing(final Supplier<? extends Idler> idler) {
+        return newRuntimeUsing(requireNonNull(idler), newRuntimeThreadFactory);
+    }
+
+    @Override
+    public AsyncMappingConfigurator mappingRuntimeUsing(final ThreadFactory threadFactory) {
+        return newRuntimeUsing(newRuntimeIdler, requireNonNull(threadFactory));
+    }
+
+    private AsyncMappingConfigurator newRuntimeUsing(final Supplier<? extends Idler> idler,
+                                                     final ThreadFactory threadFactory) {
+        mappingRuntimeSupplier(() -> AsyncRuntimeInstances.newMappingRuntime(
+                (idler != null ? idler : defaultMappingRuntimeIdlerSupplier()).get(), true,
+                threadFactory != null ? threadFactory : defaultMappingRuntimeThreadFactory()));
+        newRuntimeIdler = idler;
+        newRuntimeThreadFactory = threadFactory;
+        return this;
     }
 
     @Override

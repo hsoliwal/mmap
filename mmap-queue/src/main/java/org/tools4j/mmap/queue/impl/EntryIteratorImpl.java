@@ -23,17 +23,18 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.CloseHelper;
-import org.agrona.DirectBuffer;
-import org.agrona.MutableDirectBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.buffer.MemoryBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBufferFlyweight;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.internal.Closeables;
+import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.queue.api.Entry;
 import org.tools4j.mmap.queue.api.EntryIterator;
 import org.tools4j.mmap.queue.api.Index;
 import org.tools4j.mmap.queue.api.IterableContext;
-import org.tools4j.mmap.mapping.api.ElasticMapping;
+import org.tools4j.mmap.queue.api.IterationMode;
 
 import java.util.Iterator;
 import java.util.NoSuchElementException;
@@ -43,26 +44,27 @@ import static org.tools4j.mmap.queue.impl.Exceptions.invalidIndexException;
 import static org.tools4j.mmap.queue.impl.Exceptions.payloadMoveException;
 import static org.tools4j.mmap.queue.impl.Headers.NULL_HEADER;
 
-final class EntryIteratorImpl implements EntryIterator {
-    private static final Logger LOGGER = LoggerFactory.getLogger(EntryIteratorImpl.class);
+final class EntryIteratorImpl implements EntryIterator, Describable {
 
     private final String queueName;
     private final ReaderMappings mappings;
-    private final ElasticMapping header;
     private final Runnable onClose;
+    private final LifecycleListener lifecycleListener;
     private final IterableContextImpl context;
 
-    EntryIteratorImpl(final String queueName, final ReaderMappings mappings, final Runnable onClose) {
+    EntryIteratorImpl(final String queueName, final ReaderMappings mappings, final Runnable onClose,
+                      final LifecycleListener lifecycleListener) {
         try {
             this.queueName = requireNonNull(queueName);
             this.mappings = requireNonNull(mappings);
-            this.header = requireNonNull(mappings.header());
             this.onClose = requireNonNull(onClose);
+            this.lifecycleListener = requireNonNull(lifecycleListener);
             this.context = new IterableContextImpl(this);
         } catch (final Throwable t) {
-            CloseHelper.quietClose(mappings);
+            Closeables.closeOnFailure(mappings, t);
             throw t;
         }
+        lifecycleListener.onOpened(this);
     }
 
     @Override
@@ -88,7 +90,7 @@ final class EntryIteratorImpl implements EntryIterator {
 
     @Override
     public boolean isClosed() {
-        return header.isClosed();
+        return mappings.isClosed();
     }
 
     private void checkNotClosed() {
@@ -102,19 +104,20 @@ final class EntryIteratorImpl implements EntryIterator {
         if (!isClosed()) {
             mappings.close();
             onClose.run();
-            LOGGER.info("Entry iterator closed, queue={}", queueName);
+            lifecycleListener.onClosed(this);
         }
     }
 
     private static final class IterableContextImpl implements IterableContext, Iterator<Entry>, Entry {
         static final int FORWARD = 1;
+        static final int BACKWARD = -1;
         static final int CLOSED = 0;
         final EntryIteratorImpl iterator;
-        final ElasticMapping header;
         final ReaderMappings mappings;
-        final MutableDirectBuffer buffer = new UnsafeBuffer(0, 0);
+        final MemoryBufferFlyweight buffer = MemoryBuffers.flyweight();
         long startIndex;
         int increment;
+        boolean continuous;
         long index;
         long nextIndex;
         long nextHeader;
@@ -122,7 +125,6 @@ final class EntryIteratorImpl implements EntryIterator {
 
         IterableContextImpl(final EntryIteratorImpl iterator) {
             this.iterator = requireNonNull(iterator);
-            this.header = requireNonNull(iterator.header);
             this.mappings = requireNonNull(iterator.mappings);
             this.startIndex = Index.NULL;
             this.increment = CLOSED;
@@ -139,6 +141,7 @@ final class EntryIteratorImpl implements EntryIterator {
             }
             this.startIndex = actualStartIndex(index);
             this.increment = FORWARD;
+            this.continuous = false;
             this.index = Index.NULL;
             this.nextIndex = Index.NULL;
             this.nextHeader = NULL_HEADER;
@@ -152,7 +155,9 @@ final class EntryIteratorImpl implements EntryIterator {
             if (index < Index.LAST) {
                 throw invalidIndexException(iterator.iteratorName(), index);
             }
-            final long lastIndex = Headers.binarySearchLastIndex(header, Math.max(maxIndex, Index.FIRST));
+            final ElasticMapping header = mappings.header();
+            final long lastIndex = header != null ?
+                    Headers.binarySearchLastIndex(header, Math.max(maxIndex, Index.FIRST)) : Index.NULL;
             return lastIndex != Index.NULL ? (index == Index.LAST ? lastIndex : lastIndex + 1) : Index.FIRST;
         }
 
@@ -174,9 +179,33 @@ final class EntryIteratorImpl implements EntryIterator {
         }
 
         @Override
-        public IterableContext reverse() {
-            increment = -increment;
+        public IterableContext forward() {
+            return mode(FORWARD, false);
+        }
+
+        @Override
+        public IterableContext backward() {
+            return mode(BACKWARD, false);
+        }
+
+        @Override
+        public IterableContext continuous() {
+            return mode(FORWARD, true);
+        }
+
+        private IterableContext mode(final int increment, final boolean continuous) {
+            if (isClosed()) {
+                throw new IllegalStateException("Iterable context is closed");
+            }
+            this.increment = increment;
+            this.continuous = continuous;
             return this;
+        }
+
+        @Override
+        public IterationMode mode() {
+            return continuous ? IterationMode.CONTINUOUS : increment < 0 ? IterationMode.BACKWARD :
+                    IterationMode.FORWARD;
         }
 
         @Override
@@ -189,13 +218,17 @@ final class EntryIteratorImpl implements EntryIterator {
             if (hdr != NULL_HEADER) {
                 return true;
             }
-            hdr = Headers.moveAndGetHeader(header, next);
+            final ElasticMapping header = mappings.header();
+            hdr = header != null ? Headers.moveAndGetHeader(header, next) : NULL_HEADER;
             if (hdr != NULL_HEADER) {
                 updateMaxIndex(next);
                 nextHeader = hdr;
                 return true;
             }
-            //NOTE: nextIndex is kept so that an entry appended later at this index is returned by the next call
+            if (!continuous) {
+                //like Java collection iterators: once hasNext() returned false, it keeps returning false
+                nextIndex = Index.NULL;
+            }
             return false;
         }
 
@@ -215,7 +248,7 @@ final class EntryIteratorImpl implements EntryIterator {
 
         private long moveToNextAndInitPayload(final long index, final long hdr) {
             if (hdr == NULL_HEADER) {
-                buffer.wrap(0, 0);
+                buffer.unwrap();
                 return Index.NULL;
             }
             final int appenderId = Headers.appenderId(hdr);
@@ -230,7 +263,7 @@ final class EntryIteratorImpl implements EntryIterator {
         }
 
         @Override
-        public DirectBuffer buffer() {
+        public MemoryBuffer buffer() {
             return buffer;
         }
 
@@ -252,11 +285,12 @@ final class EntryIteratorImpl implements EntryIterator {
         @Override
         public void close() {
             if (!isClosed()) {
-                buffer.wrap(0, 0);
+                buffer.unwrap();
                 index = Index.NULL;
                 startIndex = Index.NULL;
                 nextIndex = Index.NULL;
                 increment = CLOSED;
+                continuous = false;
             }
         }
 
@@ -266,7 +300,7 @@ final class EntryIteratorImpl implements EntryIterator {
                     ":queue=" + iterator.queueName +
                     "|startIndex=" + startIndex +
                     "|index=" + index +
-                    "|reverse=" + (increment < 0) +
+                    "|mode=" + mode() +
                     "|closed=" + isClosed();
         }
     }
@@ -276,8 +310,15 @@ final class EntryIteratorImpl implements EntryIterator {
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("EntryIteratorImpl")
+                .append(":queue=").append(queueName)
+                .append("|closed=").append(isClosed());
+    }
+
+    @Override
     public String toString() {
-        return "EntryIteratorImpl:queue=" + queueName + "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 
 }

@@ -23,22 +23,27 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.mapping.api.FileInitialiser;
 import org.tools4j.mmap.mapping.config.MappingConfig;
 import org.tools4j.mmap.mapping.config.MappingStrategyConfig;
 
 import static java.util.Objects.requireNonNull;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateFileSizes;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateFilesToCreateAhead;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxFileSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxOpenFiles;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMinFileSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
 import static org.tools4j.mmap.mapping.impl.MappingConfigDefaults.MAPPING_CONFIG_DEFAULTS;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateFileSizes;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateFilesToCreateAhead;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMaxFileSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMaxOpenFiles;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMinFileSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionSize;
 
 
 public record MappingConfigImpl(long minFileSize, long maxFileSize, int regionSize, boolean expandFile,
                                 boolean rollFiles, int maxOpenFiles, int filesToCreateAhead,
-                                MappingStrategyConfig mappingStrategy) implements MappingConfig {
+                                FileInitialiser fileInitialiser, MappingStrategyConfig mappingStrategy,
+                                LifecycleListener lifecycleListener, ErrorListener errorListener)
+        implements MappingConfig {
     public MappingConfigImpl() {
         this(MAPPING_CONFIG_DEFAULTS);
     }
@@ -46,7 +51,8 @@ public record MappingConfigImpl(long minFileSize, long maxFileSize, int regionSi
     public MappingConfigImpl(final MappingConfig toCopy) {
         this(toCopy.minFileSize(), toCopy.maxFileSize(), toCopy.regionSize(), toCopy.expandFile(),
                 toCopy.rollFiles(), toCopy.maxOpenFiles(), toCopy.filesToCreateAhead(),
-                toCopy.mappingStrategy().toImmutableConfig());
+                toCopy.fileInitialiser(), toCopy.mappingStrategy().toImmutableConfig(), toCopy.lifecycleListener(),
+                toCopy.errorListener());
     }
 
     public MappingConfigImpl {
@@ -55,7 +61,10 @@ public record MappingConfigImpl(long minFileSize, long maxFileSize, int regionSi
         validateRegionSize(regionSize);
         validateMaxOpenFiles(maxOpenFiles);
         validateFilesToCreateAhead(filesToCreateAhead);
+        requireNonNull(fileInitialiser);
         requireNonNull(mappingStrategy);
+        requireNonNull(lifecycleListener);
+        requireNonNull(errorListener);
         validateFileSizes(minFileSize, maxFileSize, expandFile, regionSize);
     }
 
@@ -78,6 +87,9 @@ public record MappingConfigImpl(long minFileSize, long maxFileSize, int regionSi
                 "|rollFiles=" + config.rollFiles() +
                 "|maxOpenFiles=" + config.maxOpenFiles() +
                 "|filesToCreateAhead=" + config.filesToCreateAhead() +
-                "|mappingStrategy=" + config.mappingStrategy();
+                "|fileInitialiser=" + config.fileInitialiser() +
+                "|mappingStrategy=" + config.mappingStrategy() +
+                "|lifecycleListener=" + config.lifecycleListener() +
+                "|errorListener=" + config.errorListener();
     }
 }

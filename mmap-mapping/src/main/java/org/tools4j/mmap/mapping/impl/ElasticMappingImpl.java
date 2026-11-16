@@ -23,27 +23,29 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
-import org.agrona.concurrent.AtomicBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBufferFlyweight;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.mapping.api.RegionMetrics;
-import org.tools4j.mmap.mapping.api.Unsafe;
 import org.tools4j.mmap.mapping.unsafe.RegionMapper;
 
 import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.Validations.validateNotClosed;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
-import static org.tools4j.mmap.mapping.impl.Constraints.validatePosition;
-import static org.tools4j.mmap.mapping.impl.Constraints.validatePositionDelta;
-import static org.tools4j.mmap.mapping.impl.Constraints.validatePositionState;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validatePosition;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validatePositionDelta;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validatePositionState;
 
 public final class ElasticMappingImpl implements ElasticMapping {
     private final RegionMapper regionMapper;
     private final boolean closeRegionMapperOnClose;
     private final RegionMetrics regionMetrics;
-    private final AtomicBuffer buffer = new UnsafeBuffer(0, 0);
+    private final MemoryBufferFlyweight buffer = MemoryBuffers.flyweight();
+    private final boolean readOnly;
     private long mappedRegionPosition;
     private long mappedRegionAddress;
     private int offset;
@@ -63,6 +65,7 @@ public final class ElasticMappingImpl implements ElasticMapping {
     public ElasticMappingImpl(final RegionMapper regionMapper, final boolean closeRegionMapperOnClose) {
         validateNotClosed(regionMapper);
         this.regionMapper = requireNonNull(regionMapper);
+        this.readOnly = regionMapper.accessMode() == AccessMode.READ_ONLY;
         this.closeRegionMapperOnClose = closeRegionMapperOnClose;
         this.regionMetrics = new RegionMetricsImpl(regionMapper.regionSize());
         this.mappedRegionPosition = NULL_POSITION;
@@ -92,7 +95,7 @@ public final class ElasticMappingImpl implements ElasticMapping {
     }
 
     @Override
-    public AtomicBuffer buffer() {
+    public MutableMemoryBuffer buffer() {
         return buffer;
     }
 
@@ -164,8 +167,15 @@ public final class ElasticMappingImpl implements ElasticMapping {
     }
 
     private void initBufferAndOffset(final long regionAddress, final int offset) {
-        this.buffer.wrap(regionAddress + offset, regionSize() - offset);
+        wrapBuffer(regionAddress + offset, regionSize() - offset);
         this.offset = offset;
+    }
+
+    private void wrapBuffer(final long address, final int length) {
+        buffer.wrap(address, length);
+        if (readOnly) {
+            buffer.makeReadOnly();
+        }
     }
 
     private long map(final long regionPosition) {
@@ -184,7 +194,7 @@ public final class ElasticMappingImpl implements ElasticMapping {
         }
         assert mappedAddr != NULL_ADDRESS : "address cannot be unmapped";
         if (clearState) {
-            buffer.wrap(0, 0);
+            buffer.unwrap();
             mappedRegionPosition = NULL_POSITION;
             mappedRegionAddress = NULL_ADDRESS;
             offset = 0;

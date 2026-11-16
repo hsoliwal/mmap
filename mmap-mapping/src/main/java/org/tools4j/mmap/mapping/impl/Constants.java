@@ -30,6 +30,12 @@ import java.lang.reflect.Method;
 public enum Constants {
     ;
     /**
+     * Cache line length in bytes assumed for padding, pinned rather than detected so that layouts are the same on all
+     * platforms; 64 bytes on x86 and most ARM processors.
+     */
+    public static final int CACHE_LINE_LENGTH = 64;
+
+    /**
      * Memory page size that is exposed from internal java implementation.
      * All memory region sizes are expected to be evenly divisible by this value
      * to ensure alignment of regions with memory pages and cache lines.
@@ -42,6 +48,8 @@ public enum Constants {
      *
      * @return memory page size
      */
+    //TODO FFM: granularity without reflection into sun.nio.ch, which needs --add-opens, e.g. from the page size and
+    //64 KB on Windows
     public static long regionSizeGranularity() {
         try {
             final Class<?> fileChannelImplClass = Class.forName("sun.nio.ch.FileChannelImpl");

@@ -23,19 +23,33 @@
  */
 package org.tools4j.mmap.mapping.config;
 
-import org.agrona.concurrent.BackoffIdleStrategy;
-import org.agrona.concurrent.BusySpinIdleStrategy;
-import org.agrona.concurrent.IdleStrategy;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.config.CoreConfigurations;
+import org.tools4j.mmap.core.idle.IdleMode;
+import org.tools4j.mmap.core.idle.Idler;
+import org.tools4j.mmap.core.internal.SystemProperties.PropertyInstance;
+import org.tools4j.mmap.core.logging.LoggingLifecycleListener;
 import org.tools4j.mmap.mapping.api.AsyncRuntime;
 import org.tools4j.mmap.mapping.api.AsyncRuntimeInstances;
-import org.tools4j.mmap.mapping.impl.Constraints;
+import org.tools4j.mmap.mapping.api.CpuPinning;
+import org.tools4j.mmap.mapping.api.FileInitialiser;
+import org.tools4j.mmap.mapping.impl.AsyncRuntimeImpl;
+import org.tools4j.mmap.mapping.impl.CpuLists;
+import org.tools4j.mmap.mapping.impl.MappingResources;
+import org.tools4j.mmap.mapping.impl.MappingValidations;
+import org.tools4j.mmap.mapping.impl.StandardFileInitialiser;
 
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.IntConsumer;
-import java.util.function.LongConsumer;
 import java.util.function.Supplier;
 
-import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.SystemProperties.booleanProperty;
+import static org.tools4j.mmap.core.internal.SystemProperties.enumProperty;
+import static org.tools4j.mmap.core.internal.SystemProperties.instanceProperty;
+import static org.tools4j.mmap.core.internal.SystemProperties.intProperty;
+import static org.tools4j.mmap.core.internal.SystemProperties.longProperty;
+import static org.tools4j.mmap.core.internal.SystemProperties.namedOrClassInstanceProperty;
+import static org.tools4j.mmap.core.internal.SystemProperties.supplierProperty;
 import static org.tools4j.mmap.mapping.impl.Constants.REGION_SIZE_GRANULARITY;
 
 /**
@@ -79,7 +93,7 @@ public enum MappingConfigurations {
      * The default maximum number of files kept open in roll-files mode, used if system property
      * {@value #MAX_OPEN_FILES_PROPERTY} is not set.
      */
-    public static final int MAX_OPEN_FILES_DEFAULT = 3;
+    public static final int MAX_OPEN_FILES_DEFAULT = 4;
     /** Name of the system property to override the default number of files to create ahead in roll-files mode. */
     public static final String FILES_TO_CREATE_AHEAD_PROPERTY = "mmap.mapping.filesToCreateAhead";
     /**
@@ -89,8 +103,13 @@ public enum MappingConfigurations {
     public static final int FILES_TO_CREATE_AHEAD_DEFAULT = 0;
     /** Name of the system property to override the default region size. */
     public static final String REGION_SIZE_PROPERTY = "mmap.mapping.regionSize";
-    /** The default region size, used if system property {@value #REGION_SIZE_PROPERTY} is not set. */
-    public static final int REGION_SIZE_DEFAULT = (int)Math.max(64*1024, REGION_SIZE_GRANULARITY);
+    /**
+     * The default region size, used if system property {@value #REGION_SIZE_PROPERTY} is not set: 2 MB, the smallest
+     * region size that can be backed by huge pages (on x86-64 and aarch64 with 4k pages, for instance for files on a
+     * tmpfs with transparent huge pages enabled), and large enough to keep unmapping, with its TLB shootdowns
+     * interrupting other threads of the process, rare when data is accessed sequentially.
+     */
+    public static final int REGION_SIZE_DEFAULT = (int)Math.max(2*1024*1024, REGION_SIZE_GRANULARITY);
     /** Name of the system property to override the default initial mapping pool size. */
     public static final String INITIAL_MAPPING_POOL_SIZE_PROPERTY = "mmap.mapping.initialMappingPoolSize";
     /**
@@ -105,7 +124,7 @@ public enum MappingConfigurations {
      * The default ring cache size for mapped regions, used if system property {@value #REGION_CACHE_SIZE_PROPERTY} is
      * not set.
      */
-    public static final int REGION_CACHE_SIZE_DEFAULT = 4;
+    public static final int REGION_CACHE_SIZE_DEFAULT = 8;
     /** Name of the system property to override the default LRU cache size for mapped regions. */
     public static final String REGION_LRU_CACHE_SIZE_PROPERTY = "mmap.mapping.regionLruCacheSize";
     /**
@@ -137,7 +156,7 @@ public enum MappingConfigurations {
      * The default number of regions to map ahead, used if system property {@value #REGIONS_TO_MAP_AHEAD_PROPERTY} is
      * not set.
      */
-    public static final int REGIONS_TO_MAP_AHEAD_DEFAULT = 2;
+    public static final int REGIONS_TO_MAP_AHEAD_DEFAULT = 4;
     /** Name of the system property to override the default ahead-mapping cache size. */
     public static final String AHEAD_MAPPING_CACHE_SIZE_PROPERTY = "mmap.mapping.async.aheadMappingCacheSize";
     /**
@@ -150,28 +169,87 @@ public enum MappingConfigurations {
     /** The default unmapping cache size, used if system property {@value #UNMAPPING_CACHE_SIZE_PROPERTY} is not set. */
     public static final int UNMAPPING_CACHE_SIZE_DEFAULT = 32;
     /**
-     * Name of the system property to override the idle strategy of mapping runtimes created by default, with the class
-     * name of an {@link IdleStrategy} or of a {@link Supplier} of idle strategies (with a public no-arg constructor).
+     * Name of the system property to override the idler of mapping runtimes created by default, with the name of an
+     * {@link IdleMode} such as {@code BUSY_SPIN} or {@code BACKOFF}, or the class name of an {@link Idler}
+     * or of a {@link Supplier} of idlers (with a public no-arg constructor).
      */
-    public static final String MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY = "mmap.mapping.async.mappingRuntimeIdleStrategy";
-    /** Supplier of the default idle strategy of mapping runtimes, used if the idle strategy property is not set. */
-    public static final Supplier<IdleStrategy> MAPPING_RUNTIME_IDLE_STRATEGY_DEFAULT = () -> BusySpinIdleStrategy.INSTANCE;
+    public static final String MAPPING_RUNTIME_IDLER_PROPERTY = "mmap.mapping.async.mappingRuntimeIdler";
+    /** The default idle mode of mapping runtimes, used if the idler property is not set. */
+    public static final IdleMode MAPPING_RUNTIME_IDLER_DEFAULT = IdleMode.BACKOFF;
+    /**
+     * Name of the system property to pin the threads of mapping runtimes created by default to CPUs, with a CPU list
+     * in Linux cpulist format such as {@code 4-7}, {@code 0,2,4,6}, {@code 4-} for CPU 4 up to the highest online
+     * CPU, or {@code 4} for CPU 4 only; every mapping runtime thread is pinned to a different CPU of the list, the
+     * first one free in list order, see {@link CpuPinning#threadFactory(String, boolean, int[])}. Unmapping
+     * runtime threads are never pinned.
+     */
+    public static final String MAPPING_RUNTIME_CPUS_PROPERTY = "mmap.mapping.async.mappingRuntimeCpus";
+    /** Value of the mapping runtime CPUs property for unpinned mapping runtime threads */
+    public static final String MAPPING_RUNTIME_CPUS_NONE = "NONE";
+    /** The default CPUs of mapping runtime threads, used if the CPUs property is not set: unpinned. */
+    public static final String MAPPING_RUNTIME_CPUS_DEFAULT = MAPPING_RUNTIME_CPUS_NONE;
     /** Name of the system property to override the {@link SharingPolicy} of the default mapping runtime. */
     public static final String MAPPING_RUNTIME_SHARING_POLICY_PROPERTY = "mmap.mapping.async.mappingRuntimeSharingPolicy";
     /** The default sharing policy of the mapping runtime, used if the sharing policy property is not set. */
     public static final SharingPolicy MAPPING_RUNTIME_SHARING_POLICY_DEFAULT = SharingPolicy.SHARED;
     /**
-     * Name of the system property to override the idle strategy of unmapping runtimes created by default, with the
-     * class
-     * name of an {@link IdleStrategy} or of a {@link Supplier} of idle strategies (with a public no-arg constructor).
+     * Name of the system property to override the idler of unmapping runtimes created by default, with the name of an
+     * {@link IdleMode} such as {@code BUSY_SPIN} or {@code BACKOFF}, or the class name of an {@link Idler}
+     * or of a {@link Supplier} of idlers (with a public no-arg constructor).
      */
-    public static final String UNMAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY = "mmap.mapping.async.unmappingRuntimeIdleStrategy";
-    /** Supplier of the default idle strategy of unmapping runtimes, used if the idle strategy property is not set. */
-    public static final Supplier<IdleStrategy> UNMAPPING_RUNTIME_IDLE_STRATEGY_DEFAULT = BackoffIdleStrategy::new;
+    public static final String UNMAPPING_RUNTIME_IDLER_PROPERTY = "mmap.mapping.async.unmappingRuntimeIdler";
+    /** The default idle mode of unmapping runtimes, used if the idler property is not set. */
+    public static final IdleMode UNMAPPING_RUNTIME_IDLER_DEFAULT = IdleMode.BACKOFF;
     /** Name of the system property to override the {@link SharingPolicy} of the default unmapping runtime. */
     public static final String UNMAPPING_RUNTIME_SHARING_POLICY_PROPERTY = "mmap.mapping.async.unmappingRuntimeSharingPolicy";
     /** The default sharing policy of the unmapping runtime, used if the sharing policy property is not set. */
     public static final SharingPolicy UNMAPPING_RUNTIME_SHARING_POLICY_DEFAULT = SharingPolicy.SHARED;
+
+    /** Lifecycle listener property value for a listener ignoring all events. */
+    public static final String NO_OP_LISTENER = "NO_OP";
+    /**
+     * Lifecycle listener property value for a listener logging lifecycle events at debug level to SLF4J if present on
+     * the class path, and to {@link java.util.logging java.util.logging} otherwise, see
+     * {@link LoggingLifecycleListener}.
+     */
+    public static final String LOG_DEBUG_LISTENER = "LOG_DEBUG";
+    /**
+     * As {@link #LOG_DEBUG_LISTENER}, but logging at info level, except for {@linkplain MappingResources#INTERNAL
+     * internal resources}, which are logged at debug level.
+     */
+    public static final String LOG_INFO_LISTENER = "LOG_INFO";
+    /**
+     * As {@link #LOG_DEBUG_LISTENER}, but logging at warn level, except for {@linkplain MappingResources#INTERNAL
+     * internal resources}, which are logged at debug level.
+     */
+    public static final String LOG_WARN_LISTENER = "LOG_WARN";
+    /**
+     * Name of the system property to override the default lifecycle listener, with {@value #LOG_DEBUG_LISTENER},
+     * {@value #LOG_INFO_LISTENER}, {@value #LOG_WARN_LISTENER}, {@value #NO_OP_LISTENER} or the class name of a
+     * {@link LifecycleListener} with a public no-arg constructor.
+     */
+    public static final String LIFECYCLE_LISTENER_PROPERTY = "mmap.mapping.lifecycleListener";
+    /** The default lifecycle listener, used if the lifecycle listener property is not set. */
+    public static final String LIFECYCLE_LISTENER_DEFAULT = LOG_DEBUG_LISTENER;
+
+    /**
+     * Name of the system property to override the default file initialiser, with the name of a standard initialiser,
+     * that is, {@code LAZY}, {@code ZERO} or {@code MINUS_ONE} (see {@link FileInitialiser}), or the class name of a
+     * {@link FileInitialiser} with a public no-arg constructor.
+     */
+    public static final String FILE_INITIALISER_PROPERTY = "mmap.mapping.fileInitialiser";
+    /** The default file initialiser {@link FileInitialiser#LAZY}, used if the file initialiser property is not set. */
+    public static final String FILE_INITIALISER_DEFAULT = StandardFileInitialiser.LAZY.name();
+
+    private static final AtomicReference<PropertyInstance> LIFECYCLE_LISTENER_INSTANCE = new AtomicReference<>();
+    private static final LifecycleListener LOG_INFO = LifecycleListener.conditional(MappingResources.INTERNAL,
+            LoggingLifecycleListener.DEBUG, LoggingLifecycleListener.INFO);
+    private static final LifecycleListener LOG_WARN = LifecycleListener.conditional(MappingResources.INTERNAL,
+            LoggingLifecycleListener.DEBUG, LoggingLifecycleListener.WARN);
+    private static final AtomicReference<PropertyInstance> FILE_INITIALISER_INSTANCE = new AtomicReference<>();
+    private static final AtomicReference<PropertyInstance> MAPPING_RUNTIME_THREAD_FACTORY_INSTANCE =
+            new AtomicReference<>();
+    private static final String MAPPING_RUNTIME_THREAD_NAME_PREFIX = "mapper";
 
     /**
      * Returns the default minimum file size (and file size increment) in expand-file mode.
@@ -182,7 +260,7 @@ public enum MappingConfigurations {
      * @see MappingConfig#minFileSize()
      */
     public static long defaultMinFileSize() {
-        return getLongProperty(MIN_FILE_SIZE_PROPERTY, Constraints::validateMinFileSize, MIN_FILE_SIZE_DEFAULT);
+        return longProperty(MIN_FILE_SIZE_PROPERTY, MappingValidations::validateMinFileSize, MIN_FILE_SIZE_DEFAULT);
     }
 
     /**
@@ -194,7 +272,7 @@ public enum MappingConfigurations {
      * @see MappingConfig#maxFileSize()
      */
     public static long defaultMaxFileSize() {
-        return getLongProperty(MAX_FILE_SIZE_PROPERTY, Constraints::validateMaxFileSize, MAX_FILE_SIZE_DEFAULT);
+        return longProperty(MAX_FILE_SIZE_PROPERTY, MappingValidations::validateMaxFileSize, MAX_FILE_SIZE_DEFAULT);
     }
 
     /**
@@ -206,7 +284,7 @@ public enum MappingConfigurations {
      * @see MappingConfig#expandFile()
      */
     public static boolean defaultExpandFile() {
-        return getBooleanProperty(EXPAND_FILE_PROPERTY, EXPAND_FILE_DEFAULT);
+        return booleanProperty(EXPAND_FILE_PROPERTY, EXPAND_FILE_DEFAULT);
     }
 
     /**
@@ -218,7 +296,7 @@ public enum MappingConfigurations {
      * @see MappingConfig#rollFiles()
      */
     public static boolean defaultRollFiles() {
-        return getBooleanProperty(ROLL_FILES_PROPERTY, ROLL_FILES_DEFAULT);
+        return booleanProperty(ROLL_FILES_PROPERTY, ROLL_FILES_DEFAULT);
     }
 
     /**
@@ -230,7 +308,7 @@ public enum MappingConfigurations {
      * @see MappingConfig#maxOpenFiles()
      */
     public static int defaultMaxOpenFiles() {
-        return getIntProperty(MAX_OPEN_FILES_PROPERTY, Constraints::validateMaxOpenFiles, MAX_OPEN_FILES_DEFAULT);
+        return intProperty(MAX_OPEN_FILES_PROPERTY, MappingValidations::validateMaxOpenFiles, MAX_OPEN_FILES_DEFAULT);
     }
 
     /**
@@ -242,7 +320,22 @@ public enum MappingConfigurations {
      * @see MappingConfig#filesToCreateAhead()
      */
     public static int defaultFilesToCreateAhead() {
-        return getIntProperty(FILES_TO_CREATE_AHEAD_PROPERTY, Constraints::validateFilesToCreateAhead, FILES_TO_CREATE_AHEAD_DEFAULT);
+        return intProperty(FILES_TO_CREATE_AHEAD_PROPERTY, MappingValidations::validateFilesToCreateAhead, FILES_TO_CREATE_AHEAD_DEFAULT);
+    }
+
+    /**
+     * Returns the default file initialiser. An initialiser class given by system property is instantiated once and
+     * reused while the property value is unchanged.
+     *
+     * @return the initialiser given by system property {@value #FILE_INITIALISER_PROPERTY} if set, and by
+     *         {@link #FILE_INITIALISER_DEFAULT} otherwise
+     * @throws IllegalArgumentException if the system property value is invalid, or the initialiser class cannot be
+     *                                  instantiated
+     * @see MappingConfig#fileInitialiser()
+     */
+    public static FileInitialiser defaultFileInitialiser() {
+        return namedOrClassInstanceProperty(FILE_INITIALISER_PROPERTY, FileInitialiser.class, FILE_INITIALISER_DEFAULT,
+                StandardFileInitialiser::byName, FILE_INITIALISER_INSTANCE);
     }
 
     /**
@@ -254,7 +347,7 @@ public enum MappingConfigurations {
      * @see MappingConfig#regionSize()
      */
     public static int defaultRegionSize() {
-        return getIntProperty(REGION_SIZE_PROPERTY, Constraints::validateRegionSize, REGION_SIZE_DEFAULT);
+        return intProperty(REGION_SIZE_PROPERTY, MappingValidations::validateRegionSize, REGION_SIZE_DEFAULT);
     }
 
     /**
@@ -267,7 +360,7 @@ public enum MappingConfigurations {
      *         {@value #INITIAL_MAPPING_POOL_SIZE_DEFAULT} otherwise
      */
     public static int defaultInitialMappingPoolSize() {
-        return getIntProperty(INITIAL_MAPPING_POOL_SIZE_PROPERTY, Constraints::validateInitialPoolSize, INITIAL_MAPPING_POOL_SIZE_DEFAULT);
+        return intProperty(INITIAL_MAPPING_POOL_SIZE_PROPERTY, MappingValidations::validateInitialPoolSize, INITIAL_MAPPING_POOL_SIZE_DEFAULT);
     }
 
     /**
@@ -279,7 +372,7 @@ public enum MappingConfigurations {
      * @see MappingStrategyConfig#cacheSize()
      */
     public static int defaultRegionCacheSize() {
-        return getIntProperty(REGION_CACHE_SIZE_PROPERTY, Constraints::validateRegionCacheSize, REGION_CACHE_SIZE_DEFAULT);
+        return intProperty(REGION_CACHE_SIZE_PROPERTY, MappingValidations::validateRegionCacheSize, REGION_CACHE_SIZE_DEFAULT);
     }
 
     /**
@@ -291,7 +384,7 @@ public enum MappingConfigurations {
      * @see MappingStrategyConfig#lruCacheSize()
      */
     public static int defaultRegionLruCacheSize() {
-        return getIntProperty(REGION_LRU_CACHE_SIZE_PROPERTY, Constraints::validateRegionLruCacheSize, REGION_LRU_CACHE_SIZE_DEFAULT);
+        return intProperty(REGION_LRU_CACHE_SIZE_PROPERTY, MappingValidations::validateRegionLruCacheSize, REGION_LRU_CACHE_SIZE_DEFAULT);
     }
 
     /**
@@ -303,7 +396,7 @@ public enum MappingConfigurations {
      * @see MappingStrategyConfig#deferUnmapping()
      */
     public static boolean defaultDeferUnmapping() {
-        return getBooleanProperty(DEFER_UNMAPPING_PROPERTY, DEFER_UNMAPPING_DEFAULT);
+        return booleanProperty(DEFER_UNMAPPING_PROPERTY, DEFER_UNMAPPING_DEFAULT);
     }
 
     /**
@@ -315,7 +408,7 @@ public enum MappingConfigurations {
      * @see MappingStrategyConfig#asyncMapping()
      */
     public static boolean defaultAsyncMapping() {
-        return getBooleanProperty(ASYNC_MAPPING_PROPERTY, ASYNC_MAPPING_DEFAULT);
+        return booleanProperty(ASYNC_MAPPING_PROPERTY, ASYNC_MAPPING_DEFAULT);
     }
 
     /**
@@ -327,7 +420,7 @@ public enum MappingConfigurations {
      * @see MappingStrategyConfig#asyncUnmapping()
      */
     public static boolean defaultAsyncUnmapping() {
-        return getBooleanProperty(ASYNC_UNMAPPING_PROPERTY, ASYNC_UNMAPPING_DEFAULT);
+        return booleanProperty(ASYNC_UNMAPPING_PROPERTY, ASYNC_UNMAPPING_DEFAULT);
     }
 
     /**
@@ -339,7 +432,7 @@ public enum MappingConfigurations {
      * @see AsyncMappingConfig#regionsToMapAhead()
      */
     public static int defaultRegionsToMapAhead() {
-        return getIntProperty(REGIONS_TO_MAP_AHEAD_PROPERTY, Constraints::validateRegionsToMapAhead, REGIONS_TO_MAP_AHEAD_DEFAULT);
+        return intProperty(REGIONS_TO_MAP_AHEAD_PROPERTY, MappingValidations::validateRegionsToMapAhead, REGIONS_TO_MAP_AHEAD_DEFAULT);
     }
 
     /**
@@ -351,7 +444,7 @@ public enum MappingConfigurations {
      * @see AsyncMappingConfig#aheadMappingCacheSize()
      */
     public static int defaultAheadMappingCacheSize() {
-        return getIntProperty(AHEAD_MAPPING_CACHE_SIZE_PROPERTY, Constraints::validateAheadMappingCacheSize, AHEAD_MAPPING_CACHE_SIZE_DEFAULT);
+        return intProperty(AHEAD_MAPPING_CACHE_SIZE_PROPERTY, MappingValidations::validateAheadMappingCacheSize, AHEAD_MAPPING_CACHE_SIZE_DEFAULT);
     }
 
     /**
@@ -363,36 +456,68 @@ public enum MappingConfigurations {
      * @see AsyncUnmappingConfig#unmappingCacheSize()
      */
     public static int defaultUnmappingCacheSize() {
-        return getIntProperty(UNMAPPING_CACHE_SIZE_PROPERTY, Constraints::validateUnmappingCacheSize, UNMAPPING_CACHE_SIZE_DEFAULT);
+        return intProperty(UNMAPPING_CACHE_SIZE_PROPERTY, MappingValidations::validateUnmappingCacheSize, UNMAPPING_CACHE_SIZE_DEFAULT);
     }
 
     /**
-     * Returns the supplier of idle strategies for mapping runtimes created by default. Every invocation of the returned
-     * supplier provides a new idle strategy instance, unless the configured supplier itself returns shared instances.
+     * Returns the supplier of idlers for mapping runtimes created by default. Every invocation of the returned
+     * supplier provides an idler for one runtime thread, see {@link IdleMode#newIdler()}, unless a configured
+     * supplier returns shared instances.
      *
-     * @return a supplier for the idle strategy class (or supplier class) given by system property
-     *         {@value #MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY} if set, and
-     *         {@link #MAPPING_RUNTIME_IDLE_STRATEGY_DEFAULT} otherwise
+     * @return a supplier for the idle mode, idler class or supplier class given by system property
+     *         {@value #MAPPING_RUNTIME_IDLER_PROPERTY} if set, and {@link #MAPPING_RUNTIME_IDLER_DEFAULT} otherwise
      * @see org.tools4j.mmap.mapping.api.AsyncRuntimeInstances
      */
-    public static Supplier<? extends IdleStrategy> defaultMappingRuntimeIdleStrategySupplier() {
-        return getSupplierProperty(MAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY, IdleStrategy.class,
-                MAPPING_RUNTIME_IDLE_STRATEGY_DEFAULT);
+    public static Supplier<? extends Idler> defaultMappingRuntimeIdlerSupplier() {
+        return idlerProperty(MAPPING_RUNTIME_IDLER_PROPERTY, MAPPING_RUNTIME_IDLER_DEFAULT);
     }
 
     /**
-     * Returns the supplier of idle strategies for unmapping runtimes created by default. Every invocation of the
-     * returned supplier provides a new idle strategy instance, unless the configured supplier itself returns shared
-     * instances.
+     * Returns the supplier of idlers for unmapping runtimes created by default. Every invocation of the returned
+     * supplier provides an idler for one runtime thread, see {@link IdleMode#newIdler()}, unless a configured
+     * supplier returns shared instances.
      *
-     * @return a supplier for the idle strategy class (or supplier class) given by system property
-     *         {@value #UNMAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY} if set, and
-     *         {@link #UNMAPPING_RUNTIME_IDLE_STRATEGY_DEFAULT} otherwise
+     * @return a supplier for the idle mode, idler class or supplier class given by system property
+     *         {@value #UNMAPPING_RUNTIME_IDLER_PROPERTY} if set, and {@link #UNMAPPING_RUNTIME_IDLER_DEFAULT} otherwise
      * @see org.tools4j.mmap.mapping.api.AsyncRuntimeInstances
      */
-    public static Supplier<? extends IdleStrategy> defaultUnmappingRuntimeIdleStrategySupplier() {
-        return getSupplierProperty(UNMAPPING_RUNTIME_IDLE_STRATEGY_PROPERTY, IdleStrategy.class,
-                UNMAPPING_RUNTIME_IDLE_STRATEGY_DEFAULT);
+    public static Supplier<? extends Idler> defaultUnmappingRuntimeIdlerSupplier() {
+        return idlerProperty(UNMAPPING_RUNTIME_IDLER_PROPERTY, UNMAPPING_RUNTIME_IDLER_DEFAULT);
+    }
+
+    private static Supplier<? extends Idler> idlerProperty(final String propertyName, final IdleMode defaultMode) {
+        final String propVal = System.getProperty(propertyName);
+        final IdleMode mode = propVal == null ? defaultMode : IdleMode.forName(propVal);
+        return mode != null ? mode::newIdler : supplierProperty(propertyName, Idler.class, defaultMode::newIdler);
+    }
+
+    /**
+     * Returns the factory for threads of mapping runtimes created by default, pinning them to CPUs if configured. The
+     * thread factory is created once and reused while the property value is unchanged, so that every new mapping
+     * runtime thread is pinned to a CPU not in use by another one.
+     *
+     * @return the thread factory for the CPUs given by system property {@value #MAPPING_RUNTIME_CPUS_PROPERTY} if
+     *         set, and {@value #MAPPING_RUNTIME_CPUS_DEFAULT} otherwise
+     * @throws IllegalArgumentException if the system property value is invalid
+     * @see org.tools4j.mmap.mapping.api.AsyncRuntimeInstances
+     */
+    public static ThreadFactory defaultMappingRuntimeThreadFactory() {
+        final String propVal = System.getProperty(MAPPING_RUNTIME_CPUS_PROPERTY, MAPPING_RUNTIME_CPUS_DEFAULT).trim();
+        if (propVal.equalsIgnoreCase(MAPPING_RUNTIME_CPUS_NONE)) {
+            return AsyncRuntimeImpl.DEFAULT_THREAD_FACTORY;
+        }
+        return instanceProperty(propVal, ThreadFactory.class, MAPPING_RUNTIME_THREAD_FACTORY_INSTANCE,
+                value -> mappingRuntimeThreadFactory(MAPPING_RUNTIME_CPUS_PROPERTY, value));
+    }
+
+    private static ThreadFactory mappingRuntimeThreadFactory(final String propName, final String propVal) {
+        try {
+            return CpuPinning.threadFactory(MAPPING_RUNTIME_THREAD_NAME_PREFIX, true, CpuLists.parse(propVal),
+                    CoreConfigurations.defaultErrorListener());
+        } catch (final IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid value for system property: " + propName + "=" + propVal +
+                    ", expected " + MAPPING_RUNTIME_CPUS_NONE + " or a CPU list such as 4-7, 0,2,4,6 or 4-", e);
+        }
     }
 
     /**
@@ -403,7 +528,7 @@ public enum MappingConfigurations {
      * @throws IllegalArgumentException if the system property value is not a {@link SharingPolicy} constant name
      */
     public static SharingPolicy defaultMappingRuntimeSharingPolicy() {
-        return getEnumProperty(MAPPING_RUNTIME_SHARING_POLICY_PROPERTY, SharingPolicy.class,
+        return enumProperty(MAPPING_RUNTIME_SHARING_POLICY_PROPERTY, SharingPolicy.class,
                 MAPPING_RUNTIME_SHARING_POLICY_DEFAULT);
     }
 
@@ -415,8 +540,24 @@ public enum MappingConfigurations {
      * @throws IllegalArgumentException if the system property value is not a {@link SharingPolicy} constant name
      */
     public static SharingPolicy defaultUnmappingRuntimeSharingPolicy() {
-        return getEnumProperty(UNMAPPING_RUNTIME_SHARING_POLICY_PROPERTY, SharingPolicy.class,
+        return enumProperty(UNMAPPING_RUNTIME_SHARING_POLICY_PROPERTY, SharingPolicy.class,
                 UNMAPPING_RUNTIME_SHARING_POLICY_DEFAULT);
+    }
+
+    /**
+     * Returns the default lifecycle listener, also used by the shared async runtimes. The logging listeners log
+     * lifecycle events at the given level to SLF4J if present on the class path, and to
+     * {@link java.util.logging java.util.logging} otherwise. A listener class given by system property is instantiated
+     * once and reused while the property value is unchanged.
+     *
+     * @return the listener given by system property {@value #LIFECYCLE_LISTENER_PROPERTY} if set, and by
+     *         {@link #LIFECYCLE_LISTENER_DEFAULT} otherwise
+     * @throws IllegalArgumentException if the system property value is invalid, or the listener class cannot be
+     *                                  instantiated
+     */
+    public static LifecycleListener defaultLifecycleListener() {
+        return namedOrClassInstanceProperty(LIFECYCLE_LISTENER_PROPERTY, LifecycleListener.class, LIFECYCLE_LISTENER_DEFAULT,
+                MappingConfigurations::lifecycleListenerForName, LIFECYCLE_LISTENER_INSTANCE);
     }
 
     /**
@@ -443,115 +584,24 @@ public enum MappingConfigurations {
         return AsyncRuntimeInstances.unmappingRuntimeSupplier(defaultUnmappingRuntimeSharingPolicy());
     }
 
-    private static int getIntProperty(final String propertyName, final IntConsumer validator, final int defaultValue) {
-        final String propVal = System.getProperty(propertyName, null);
-        if (propVal == null) {
-            return defaultValue;
-        }
-        try {
-            final int intValue = Integer.parseInt(propVal);
-            validator.accept(intValue);
-            return intValue;
-        } catch (final Exception e) {
-            throw new IllegalArgumentException("Invalid value for system property: " + propertyName + "=" + propVal, e);
-        }
-    }
-
-    private static long getLongProperty(final String propertyName, final LongConsumer validator, final long defaultValue) {
-        final String propVal = System.getProperty(propertyName, null);
-        if (propVal == null) {
-            return defaultValue;
-        }
-        try {
-            final long longValue = Long.parseLong(propVal);
-            validator.accept(longValue);
-            return longValue;
-        } catch (final Exception e) {
-            throw new IllegalArgumentException("Invalid value for system property: " + propertyName + "=" + propVal, e);
-        }
-    }
-
-    private static boolean getBooleanProperty(final String propertyName, final boolean defaultValue) {
-        final String propVal = System.getProperty(propertyName, null);
-        if (propVal == null) {
-            return defaultValue;
-        }
-        if ("true".equalsIgnoreCase(propVal)) {
-            return true;
-        }
-        if ("false".equalsIgnoreCase(propVal)) {
-            return false;
-        }
-        throw new IllegalArgumentException("Invalid value for system property: " + propertyName + "=" + propVal +
-                " (expected true or false)");
-    }
-
-    @SuppressWarnings("SameParameterValue")
-    private static <E extends Enum<E>> E getEnumProperty(final String propertyName,
-                                                         final Class<E> type,
-                                                         final E defaultValue) {
-        final String propVal = System.getProperty(propertyName, null);
-        if (propVal == null) {
-            return defaultValue;
-        }
-        try {
-            return Enum.valueOf(type, propVal);
-        } catch (final Exception e) {
-            throw new IllegalArgumentException("Invalid value for system property: " + propertyName + "=" + propVal, e);
-        }
-    }
-
-    @SuppressWarnings("SameParameterValue")
-    private static <T> Supplier<T> getSupplierProperty(final String propertyName,
-                                                       final Class<T> type,
-                                                       final Supplier<T> defaultValueSupplier) {
-        requireNonNull(propertyName);
-        requireNonNull(type);
-        requireNonNull(defaultValueSupplier);
-        final String propVal = System.getProperty(propertyName, null);
-        return propVal == null ? defaultValueSupplier : newSupplier(propertyName, propVal, type);
-    }
-
     /**
-     * Returns a supplier for the type given by class name as property value, either the class of the value itself or
-     * of a supplier of such values. Every invocation returns a new value, unless it is a supplier returning the same
-     * value every time.
+     * Returns the lifecycle listener for a name accepted by the lifecycle listener property, also accepted by the queue
+     * module's lifecycle listener property.
+     *
+     * @param name the name, {@value #LOG_DEBUG_LISTENER}, {@value #LOG_INFO_LISTENER}, {@value #LOG_WARN_LISTENER} or
+     *             {@value #NO_OP_LISTENER}
+     * @return the listener for the name, or null if it is not the name of a listener
      */
-    private static <T> Supplier<T> newSupplier(final String propName, final String propVal, final Class<T> type) {
-        requireNonNull(propName);
-        requireNonNull(type);
-        final AtomicReference<Supplier<?>> supplierPtr = new AtomicReference<>();
-        return () -> {
-            try {
-                Supplier<?> supplier = supplierPtr.get();
-                if (supplier != null) {
-                    return type.cast(supplier.get());
-                }
-                final Object value = newObjInstance(propName, propVal, Object.class);
-                if (type.isInstance(value)) {
-                    supplierPtr.set(() -> newObjInstance(propName, propVal, type));
-                    return type.cast(value);
-                }
-                if (value instanceof Supplier) {
-                    supplier = (Supplier<?>) value;
-                    supplierPtr.set(supplier);
-                    return type.cast(supplier.get());
-                }
-                throw new IllegalArgumentException("Value expected to be of type " + type.getName() +
-                        " or a supplier of such a value, but was found to be: " + value);
-            } catch (final Exception e) {
-                throw new IllegalArgumentException("Invalid value for system property: " + propName + "=" + propVal, e);
-            }
-        };
-    }
-
-    private static <T> T newObjInstance(final String propName, final String propVal, final Class<T> type) {
-        try {
-            final Class<?> clazz = Class.forName(propVal);
-            final Object value = clazz.getDeclaredConstructor().newInstance();
-            return type.cast(value);
-        } catch (final Exception e) {
-            throw new IllegalArgumentException("Invalid value for system property: " + propName + "=" + propVal, e);
+    public static LifecycleListener lifecycleListenerForName(final String name) {
+        if (name == null) {
+            return null;
         }
+        return switch (name) {
+            case LOG_DEBUG_LISTENER -> LoggingLifecycleListener.DEBUG;
+            case LOG_INFO_LISTENER -> LOG_INFO;
+            case LOG_WARN_LISTENER -> LOG_WARN;
+            case NO_OP_LISTENER -> LifecycleListener.NO_OP;
+            default -> null;
+        };
     }
 }

@@ -23,54 +23,57 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.CloseHelper;
-import org.agrona.DirectBuffer;
-import org.agrona.MutableDirectBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.buffer.MemoryBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBufferFlyweight;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.internal.Closeables;
+import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.queue.api.EntryReader;
 import org.tools4j.mmap.queue.api.Index;
 import org.tools4j.mmap.queue.api.ReadingContext;
-import org.tools4j.mmap.mapping.api.ElasticMapping;
 
 import static java.util.Objects.requireNonNull;
 import static org.tools4j.mmap.queue.impl.Exceptions.invalidIndexException;
 import static org.tools4j.mmap.queue.impl.Exceptions.payloadMoveException;
 import static org.tools4j.mmap.queue.impl.Headers.NULL_HEADER;
 
-final class EntryReaderImpl implements EntryReader {
-    private static final Logger LOGGER = LoggerFactory.getLogger(EntryReaderImpl.class);
+final class EntryReaderImpl implements EntryReader, Describable {
 
     private final String queueName;
     private final ReaderMappings mappings;
-    private final ElasticMapping header;
     private final Runnable onClose;
+    private final LifecycleListener lifecycleListener;
     private final ReadingContextImpl context;
 
-    EntryReaderImpl(final String queueName, final ReaderMappings mappings, final Runnable onClose) {
+    EntryReaderImpl(final String queueName, final ReaderMappings mappings, final Runnable onClose,
+                    final LifecycleListener lifecycleListener) {
         try {
             this.queueName = requireNonNull(queueName);
             this.mappings = requireNonNull(mappings);
-            this.header = requireNonNull(mappings.header());
             this.onClose = requireNonNull(onClose);
+            this.lifecycleListener = requireNonNull(lifecycleListener);
             this.context = new ReadingContextImpl(this);
         } catch (final Throwable t) {
-            CloseHelper.quietClose(mappings);
+            Closeables.closeOnFailure(mappings, t);
             throw t;
         }
+        lifecycleListener.onOpened(this);
     }
 
     @Override
     public long lastIndex() {
         checkNotClosed();
-        return Headers.binarySearchLastIndex(header, Index.FIRST);
+        final ElasticMapping header = mappings.header();
+        return header != null ? Headers.binarySearchLastIndex(header, Index.FIRST) : Index.NULL;
     }
 
     @Override
     public boolean hasEntry(final long index) {
         checkNotClosed();
-        return Headers.hasNonEmptyHeaderAt(header, index);
+        final ElasticMapping header = mappings.header();
+        return header != null && Headers.hasNonEmptyHeaderAt(header, index);
     }
 
     @Override
@@ -91,7 +94,7 @@ final class EntryReaderImpl implements EntryReader {
 
     @Override
     public boolean isClosed() {
-        return header.isClosed();
+        return mappings.isClosed();
     }
 
     private void checkNotClosed() {
@@ -105,22 +108,20 @@ final class EntryReaderImpl implements EntryReader {
         if (!isClosed()) {
             mappings.close();
             onClose.run();
-            LOGGER.info("Entry reader closed, queue={}", queueName);
+            lifecycleListener.onClosed(this);
         }
     }
 
     private static final class ReadingContextImpl implements ReadingContext {
         final EntryReaderImpl reader;
-        final ElasticMapping header;
         final ReaderMappings mappings;
-        final MutableDirectBuffer buffer = new UnsafeBuffer(0, 0);
+        final MemoryBufferFlyweight buffer = MemoryBuffers.flyweight();
         long maxIndex;
         long index;
         boolean closed;
 
         ReadingContextImpl(final EntryReaderImpl reader) {
             this.reader = requireNonNull(reader);
-            this.header = requireNonNull(reader.header);
             this.mappings = requireNonNull(reader.mappings);
             this.maxIndex = Index.NULL;
             this.index = Index.NULL;
@@ -149,6 +150,10 @@ final class EntryReaderImpl implements EntryReader {
         }
 
         private long initPayloadBuffer(final long index) {
+            final ElasticMapping header = mappings.header();
+            if (header == null) {
+                return Index.NULL;
+            }
             final long hdr = index != Index.LAST ?
                     Headers.moveAndGetHeader(header, index):
                     Headers.binarySearchAndGetLastHeader(header, Math.max(maxIndex, Index.FIRST));
@@ -167,7 +172,7 @@ final class EntryReaderImpl implements EntryReader {
         }
 
         @Override
-        public DirectBuffer buffer() {
+        public MemoryBuffer buffer() {
             return buffer;
         }
 
@@ -189,7 +194,7 @@ final class EntryReaderImpl implements EntryReader {
         @Override
         public void close() {
             if (!closed) {
-                buffer.wrap(0, 0);
+                buffer.unwrap();
                 index = Index.NULL;
                 closed = true;
             }
@@ -209,7 +214,14 @@ final class EntryReaderImpl implements EntryReader {
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("EntryReaderImpl")
+                .append(":queue=").append(queueName)
+                .append("|closed=").append(isClosed());
+    }
+
+    @Override
     public String toString() {
-        return "EntryReaderImpl:queue=" + queueName + "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 }

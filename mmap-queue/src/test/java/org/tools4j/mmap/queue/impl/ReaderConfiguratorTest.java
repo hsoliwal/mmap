@@ -86,7 +86,7 @@ class ReaderConfiguratorTest {
         }
     }
 
-    /** Defaults returning the "unset" sentinel for every value, forcing fallback to system defaults */
+    /** Defaults returning the "unset" sentinel for every value, which is invalid */
     private static ReaderConfig unsetDefaults() {
         return new ReaderConfig() {
             @Override
@@ -129,9 +129,16 @@ class ReaderConfiguratorTest {
     }
 
     @Test
-    void unsetDefaultsFallBackToEntryReaderSystemDefaults() {
-        assertEquals(Kind.ENTRY_READER.expected,
-                ReaderConfigurator.configure(unsetDefaults()).toImmutableReaderConfig());
+    void invalidDefaultsThrowUnlessValuesAreSetExplicitly() {
+        final ReaderConfigurator config = ReaderConfigurator.configure(unsetDefaults());
+        assertThrows(IllegalStateException.class, config::headerMappingStrategy);
+        assertThrows(IllegalStateException.class, config::payloadMappingStrategy);
+        assertThrows(IllegalStateException.class, config::maxOpenHeaderFiles);
+        assertThrows(IllegalStateException.class, config::maxOpenPayloadFiles);
+        assertThrows(IllegalStateException.class, config::toImmutableReaderConfig);
+
+        config.mappingStrategy(STRATEGY_A).maxOpenHeaderFiles(1).maxOpenPayloadFiles(2);
+        assertEquals(new ReaderConfigImpl(STRATEGY_A, STRATEGY_A, 1, 2), config.toImmutableReaderConfig());
     }
 
     @Test
@@ -153,12 +160,14 @@ class ReaderConfiguratorTest {
     }
 
     @Test
-    void nonPositiveMaxOpenFilesResetToDefault() {
+    void zeroMaxOpenFilesResetsToDefaultAndNegativeIsRejected() {
         final ReaderConfigurator config = ReaderConfigurator.configure(customDefaults())
                 .maxOpenHeaderFiles(7).maxOpenPayloadFiles(8);
-        config.maxOpenHeaderFiles(0).maxOpenPayloadFiles(-1);
+        config.maxOpenHeaderFiles(0).maxOpenPayloadFiles(0);
         assertEquals(5, config.maxOpenHeaderFiles());
         assertEquals(6, config.maxOpenPayloadFiles());
+        assertThrows(IllegalArgumentException.class, () -> config.maxOpenHeaderFiles(-1));
+        assertThrows(IllegalArgumentException.class, () -> config.maxOpenPayloadFiles(-1));
     }
 
     @Test

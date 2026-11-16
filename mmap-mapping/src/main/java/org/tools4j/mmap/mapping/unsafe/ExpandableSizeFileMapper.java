@@ -23,25 +23,27 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.config.CoreConfigurations;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.FileInitialiser;
-import org.tools4j.mmap.mapping.api.Unsafe;
+import org.tools4j.mmap.mapping.config.MappingConfigurations;
 
 import java.io.File;
-import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static org.tools4j.mmap.core.internal.Validations.validateNotClosed;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMaxFileSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateMinFileSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMaxFileSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateMinFileSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionSize;
 
 /**
  * A {@link FileMapper} for a file that grows on demand between a minimum and maximum size.
@@ -50,13 +52,12 @@ import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
  * multiple threads.
  */
 @Unsafe
-public class ExpandableSizeFileMapper implements FileMapper {
-    private static final Logger LOGGER = LoggerFactory.getLogger(ExpandableSizeFileMapper.class);
+public class ExpandableSizeFileMapper implements FileMapper, Describable {
     private final File file;
     private final long minFileSize;
     private final long maxFileSize;
     private final FileChannelProvider fileChannelProvider;
-    private final PreTouchHelper preTouchHelper;
+    private final PreToucher preToucher;
     private final AtomicLong fileLengthCache = new AtomicLong();
     private final AtomicBoolean fileSizeExtensionLatch = new AtomicBoolean();
 
@@ -65,6 +66,17 @@ public class ExpandableSizeFileMapper implements FileMapper {
                                     final long maxFileSize,
                                     final int regionSize,
                                     final FileInitialiser fileInitialiser) {
+        this(file, minFileSize, maxFileSize, regionSize, fileInitialiser,
+                MappingConfigurations.defaultLifecycleListener(), CoreConfigurations.defaultErrorListener());
+    }
+
+    public ExpandableSizeFileMapper(final File file,
+                                    final long minFileSize,
+                                    final long maxFileSize,
+                                    final int regionSize,
+                                    final FileInitialiser fileInitialiser,
+                                    final LifecycleListener lifecycleListener,
+                                    final ErrorListener errorListener) {
         this.file = Objects.requireNonNull(file);
         validateRegionSize(regionSize);
         validateMinFileSize(minFileSize);
@@ -88,8 +100,9 @@ public class ExpandableSizeFileMapper implements FileMapper {
             this.minFileSize = minFileSize;
             this.maxFileSize = maxFileSize;
         }
-        this.fileChannelProvider = new FileChannelProvider(this, file, fileInitialiser, minFileSize);
-        this.preTouchHelper = new PreTouchHelper(AccessMode.READ_WRITE);
+        this.fileChannelProvider = new FileChannelProvider(this, AccessMode.READ_WRITE, file, fileInitialiser,
+                minFileSize, lifecycleListener, errorListener);
+        this.preToucher = new PreToucher();
     }
 
     @Override
@@ -98,7 +111,7 @@ public class ExpandableSizeFileMapper implements FileMapper {
     }
 
     @Override
-    public long map(final long position, final int length) {
+    public long map(final long position, final int length, final boolean preTouch) {
         assert position >= 0;
         assert length >= 0;
         //NOTE: relying on fileChannelProvider's closed check
@@ -110,9 +123,11 @@ public class ExpandableSizeFileMapper implements FileMapper {
         if (channel == null || !channel.isOpen()) {
             return NULL_ADDRESS;
         }
-        ensureFileLength(channel, position + length);
+        ensureFileLength(position + length);
         final long address = FileChannels.map(channel, AccessMode.READ_WRITE.mapMode(), position, length);
-        preTouchHelper.preTouch(position, length, address);
+        if (preTouch) {
+            preToucher.preTouch(position, length, address);
+        }
         return address;
     }
 
@@ -129,7 +144,7 @@ public class ExpandableSizeFileMapper implements FileMapper {
         FileChannels.unmap(address, length);
     }
 
-    void ensureFileLength(final FileChannel channel, final long minLength) {
+    private void ensureFileLength(final long minLength) {
         long cachedFileLength = fileLengthCache.get();
         if (minLength <= cachedFileLength) {
             return;
@@ -137,41 +152,23 @@ public class ExpandableSizeFileMapper implements FileMapper {
         if (minLength > maxFileSize) {
             throw new IllegalStateException("Exceeded max file size " + maxFileSize + " for file " + file);
         }
-        do {
-            final long fileLength = fileLength(channel);
-            if (fileLength > cachedFileLength) {
-                cachedFileLength = fileLengthCache.accumulateAndGet(fileLength, Math::max);
-            }
-            if (cachedFileLength < minLength) {
-                final long extendedLength = tryExtendFile(channel, fileLength, minLength);
-                if (extendedLength > cachedFileLength) {
-                    cachedFileLength = fileLengthCache.accumulateAndGet(extendedLength, Math::max);
+        //NOTE: threads waiting for another thread's extension spin on the cached length, published before the latch is
+        //      released, so they neither query the file length nor contend for the channel's lock meanwhile; they
+        //      read the latch before the CAS, which would otherwise write its cache line on every spin
+        boolean tryExtensionLatch = true;
+        while (cachedFileLength < minLength) {
+            if (tryExtensionLatch && fileSizeExtensionLatch.compareAndSet(false, true)) {
+                try {
+                    final long fileLength = fileChannelProvider.extend(newFileLength(minLength));
+                    cachedFileLength = fileLengthCache.accumulateAndGet(fileLength, Math::max);
+                } finally {
+                    fileSizeExtensionLatch.set(false);
                 }
-            }
-        } while (cachedFileLength < minLength);
-    }
-
-    private long tryExtendFile(final FileChannel channel, final long fileLength, final long minLength) {
-        final FileChannel fileChannel = fileChannelProvider.getIfOpen();
-        if (fileChannel == null) {
-            return fileLength;
-        }
-        if (!fileSizeExtensionLatch.compareAndSet(false, true)) {
-            return fileLength;
-        }
-        try {
-            final long newestFileLength = channel.size();
-            if (newestFileLength < minLength) {
-                final long newLength = newFileLength(minLength);
-                return fileChannelProvider.setSize(newLength) ? newLength : channel.size();
             } else {
-                return newestFileLength;
+                Thread.onSpinWait();
+                tryExtensionLatch = !fileSizeExtensionLatch.get();
+                cachedFileLength = fileLengthCache.get();
             }
-        } catch (final IOException e) {
-            throw new IllegalStateException("Extending file " + file + " to size " + minLength +
-                    " failed, e=" + e, e);
-        } finally {
-            fileSizeExtensionLatch.set(false);
         }
     }
 
@@ -179,14 +176,6 @@ public class ExpandableSizeFileMapper implements FileMapper {
         final long newFileLength = minFileSize + minFileSize * ((minLength - 1) / minFileSize);
         assert newFileLength <= maxFileSize : "newFileLen exceeds maxFileSize";
         return newFileLength;
-    }
-
-    private long fileLength(final FileChannel channel) {
-        try {
-            return channel.size();
-        } catch (final IOException e) {
-            throw new IllegalStateException("Reading the length of file " + file + " failed, e=" + e, e);
-        }
     }
 
     @Override
@@ -197,18 +186,21 @@ public class ExpandableSizeFileMapper implements FileMapper {
     @Override
     public void close() {
         if (fileChannelProvider.closeIfNeeded()) {
-            preTouchHelper.reset();
-            LOGGER.info("Closed: {}", this);
+            preToucher.reset();
         }
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("ExpandableSizeFileMapper")
+                .append(":file=").append(file.getPath())
+                .append("|minFileSize=").append(minFileSize)
+                .append("|maxFileSize=").append(maxFileSize)
+                .append("|closed=").append(isClosed());
+    }
+
+    @Override
     public String toString() {
-        return "ExpandableSizeFileMapper" +
-                ":minFileSize=" + minFileSize +
-                "|maxFileSize=" + maxFileSize +
-                "|file=" + file +
-                "|size=" + file.length() +
-                "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 }

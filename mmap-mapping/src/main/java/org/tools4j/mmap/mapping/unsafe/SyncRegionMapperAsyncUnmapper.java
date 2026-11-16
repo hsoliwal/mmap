@@ -23,23 +23,19 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.agrona.concurrent.AtomicBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.tools4j.mmap.mapping.api.AsyncRuntime;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AsyncRuntime.Recurring;
+import org.tools4j.mmap.mapping.api.AsyncRuntime;
 import org.tools4j.mmap.mapping.api.RegionMetrics;
-import org.tools4j.mmap.mapping.api.Unsafe;
 import org.tools4j.mmap.mapping.impl.RegionMetricsImpl;
 
-import java.nio.ByteBuffer;
-
 import static java.util.Objects.requireNonNull;
-import static org.agrona.BitUtil.CACHE_LINE_LENGTH;
+import static org.tools4j.mmap.core.internal.Validations.validatePowerOfTwo;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
-import static org.tools4j.mmap.mapping.impl.Constraints.validatePowerOfTwo;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionSize;
+import static org.tools4j.mmap.mapping.impl.Constants.CACHE_LINE_LENGTH;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionSize;
 
 /**
  * A direct region mapper that delegates mapping operations synchronously to the underlying {@link FileMapper} and
@@ -50,7 +46,6 @@ record SyncRegionMapperAsyncUnmapper(AsyncRuntime asyncRuntime,
                                      FileMapper fileMapper,
                                      RegionMetrics regionMetrics,
                                      AsyncUnmapper asyncUnmapper) implements DirectRegionMapper {
-    private static final Logger LOGGER = LoggerFactory.getLogger(SyncRegionMapperAsyncUnmapper.class);
 
     public SyncRegionMapperAsyncUnmapper(final AsyncRuntime asyncRuntime,
                                          final FileMapper fileMapper,
@@ -100,13 +95,9 @@ record SyncRegionMapperAsyncUnmapper(AsyncRuntime asyncRuntime,
 
     @Override
     public long mapInternal(final long position, final int regionSize) {
-        try {
-            final long addr = fileMapper.map(position, regionSize);
-            return addr > 0 ? addr : NULL_ADDRESS;
-        } catch (final Exception exception) {
-            LOGGER.error("Failed to map position {} with region size {}: {}", position, regionSize, exception, exception);
-            return NULL_ADDRESS;
-        }
+        //NOTE: no pre-touch, mapped synchronously for immediate use
+        final long addr = fileMapper.map(position, regionSize, false);
+        return addr > 0 ? addr : NULL_ADDRESS;
     }
 
     @Override
@@ -127,7 +118,6 @@ record SyncRegionMapperAsyncUnmapper(AsyncRuntime asyncRuntime,
             asyncUnmapper.stopAndWait();
             asyncRuntime.deregister(asyncUnmapper);
             fileMapper.close();
-            LOGGER.info("Closed {}.", this);
         }
     }
 
@@ -149,14 +139,15 @@ record SyncRegionMapperAsyncUnmapper(AsyncRuntime asyncRuntime,
         final FileMapper fileMapper;
         final int regionSize;
         final int ringMask;
-        final AtomicBuffer buffer;//header, then pos/addr pairs
+        final MutableMemoryBuffer buffer;//header, then pos/addr pairs
         final Timeout closeTimeout = new Timeout();
 
         AsyncUnmapper(final FileMapper fileMapper, final int regionSize, final int unmapCacheSize) {
             this.fileMapper = requireNonNull(fileMapper);
             this.regionSize = regionSize;
             this.ringMask = unmapCacheSize - 1;
-            this.buffer = new UnsafeBuffer(ByteBuffer.allocateDirect(HEADER_LENGTH + unmapCacheSize * RECORD_LENGTH));
+            this.buffer = MemoryBuffers.allocateDirect(HEADER_LENGTH + unmapCacheSize * RECORD_LENGTH,
+                    CACHE_LINE_LENGTH);
         }
 
         private int ringIndex(final int index) {
@@ -202,7 +193,7 @@ record SyncRegionMapperAsyncUnmapper(AsyncRuntime asyncRuntime,
             final long pos = buffer.getLong(offset);
             final long addr = buffer.getLong(offset + Long.BYTES);
             buffer.setMemory(offset, Long.BYTES + Long.BYTES, (byte)0);
-            buffer.putIntOrdered(CONSUMER_OFFSET, ixConsumerNew);
+            buffer.putIntRelease(CONSUMER_OFFSET, ixConsumerNew);
             fileMapper.unmap(pos, addr, regionSize);
             return 1;
         }
@@ -215,7 +206,7 @@ record SyncRegionMapperAsyncUnmapper(AsyncRuntime asyncRuntime,
                 final int offset = offset(ixProducer);
                 buffer.putLong(offset, position);
                 buffer.putLong(offset + Long.BYTES, address);
-                buffer.putIntOrdered(PRODUCER_OFFSET, ixProducerNew);
+                buffer.putIntRelease(PRODUCER_OFFSET, ixProducerNew);
                 return true;
             }
             return false;

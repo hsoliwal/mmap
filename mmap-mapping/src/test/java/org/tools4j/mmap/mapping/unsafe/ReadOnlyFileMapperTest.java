@@ -23,7 +23,6 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.tools4j.mmap.mapping.api.AccessMode;
@@ -49,7 +48,7 @@ import static org.tools4j.mmap.mapping.impl.Constants.REGION_SIZE_GRANULARITY;
 class ReadOnlyFileMapperTest {
 
     private static final int REGION_SIZE = (int) REGION_SIZE_GRANULARITY;
-    private static final FileInitialiser INITIALISER = FileInitialiser.none();
+    private static final FileInitialiser FILE_INITIALISER = FileInitialiser.LAZY;
 
     @TempDir
     Path tempDir;
@@ -64,10 +63,10 @@ class ReadOnlyFileMapperTest {
 
     private static byte firstByte(final FileMapper mapper, final int region) {
         final long position = (long) region * REGION_SIZE;
-        final long address = mapper.map(position, REGION_SIZE);
+        final long address = mapper.map(position, REGION_SIZE, false);
         assertNotEquals(NULL_ADDRESS, address, "region " + region);
         try {
-            return new UnsafeBuffer(address, REGION_SIZE).getByte(0);
+            return TestBuffers.wrap(address, REGION_SIZE).getByte(0);
         } finally {
             mapper.unmap(position, address, REGION_SIZE);
         }
@@ -76,7 +75,7 @@ class ReadOnlyFileMapperTest {
     @Test
     void mapsExistingRegions() throws IOException {
         final Path path = fileWithRegions(2);
-        try (final FileMapper mapper = new ReadOnlyFileMapper(path.toString(), INITIALISER)) {
+        try (final FileMapper mapper = new ReadOnlyFileMapper(path.toString(), FILE_INITIALISER)) {
             assertEquals(AccessMode.READ_ONLY, mapper.accessMode());
             assertEquals(1, firstByte(mapper, 0));
             assertEquals(2, firstByte(mapper, 1));
@@ -86,9 +85,9 @@ class ReadOnlyFileMapperTest {
     @Test
     void mappingBeyondFileEndFailsUntilFileHasGrown() throws IOException {
         final Path path = fileWithRegions(1);
-        try (final FileMapper mapper = new ReadOnlyFileMapper(path.toFile(), INITIALISER)) {
+        try (final FileMapper mapper = new ReadOnlyFileMapper(path.toFile(), FILE_INITIALISER)) {
             assertEquals(1, firstByte(mapper, 0));
-            assertEquals(NULL_ADDRESS, mapper.map(REGION_SIZE, REGION_SIZE));
+            assertEquals(NULL_ADDRESS, mapper.map(REGION_SIZE, REGION_SIZE, false));
             final byte[] secondRegion = new byte[REGION_SIZE];
             secondRegion[0] = 42;
             Files.write(path, secondRegion, StandardOpenOption.APPEND);
@@ -99,25 +98,25 @@ class ReadOnlyFileMapperTest {
     @Test
     void missingOrEmptyFileIsNotMapped() throws IOException {
         final File missing = tempDir.resolve("missing.map").toFile();
-        try (final FileMapper mapper = new ReadOnlyFileMapper(missing, INITIALISER)) {
-            assertEquals(NULL_ADDRESS, mapper.map(0, REGION_SIZE));
+        try (final FileMapper mapper = new ReadOnlyFileMapper(missing, FILE_INITIALISER)) {
+            assertEquals(NULL_ADDRESS, mapper.map(0, REGION_SIZE, false));
             assertFalse(missing.exists(), "read-only mapper does not create files");
         }
         final File empty = Files.createFile(tempDir.resolve("empty.map")).toFile();
-        try (final FileMapper mapper = new ReadOnlyFileMapper(empty, INITIALISER)) {
-            assertEquals(NULL_ADDRESS, mapper.map(0, REGION_SIZE));
+        try (final FileMapper mapper = new ReadOnlyFileMapper(empty, FILE_INITIALISER)) {
+            assertEquals(NULL_ADDRESS, mapper.map(0, REGION_SIZE, false));
         }
     }
 
     @Test
     void closedMapperRejectsMapAndUnmap() throws IOException {
-        final FileMapper mapper = new ReadOnlyFileMapper(fileWithRegions(1).toFile(), INITIALISER);
-        final long address = mapper.map(0, REGION_SIZE);
+        final FileMapper mapper = new ReadOnlyFileMapper(fileWithRegions(1).toFile(), FILE_INITIALISER);
+        final long address = mapper.map(0, REGION_SIZE, false);
         mapper.close();
         assertTrue(mapper.isClosed());
         assertTrue(mapper.toString().endsWith("|closed=true"), mapper.toString());
         mapper.close();
-        assertThrows(IllegalStateException.class, () -> mapper.map(0, REGION_SIZE));
+        assertThrows(IllegalStateException.class, () -> mapper.map(0, REGION_SIZE, false));
         assertThrows(IllegalStateException.class, () -> mapper.unmap(0, address, REGION_SIZE));
         FileChannels.unmap(address, REGION_SIZE);
     }

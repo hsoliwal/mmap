@@ -23,25 +23,27 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
-import org.agrona.concurrent.AtomicBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBufferFlyweight;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.RegionMapping;
 import org.tools4j.mmap.mapping.api.RegionMetrics;
-import org.tools4j.mmap.mapping.api.Unsafe;
 import org.tools4j.mmap.mapping.unsafe.RegionMapper;
 
 import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.Validations.validateNotClosed;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateRegionPosition;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateRegionPosition;
 
 public final class RegionMappingImpl implements RegionMapping {
     private final RegionMapper regionMapper;
     private final RegionMetrics regionMetrics;
     private final boolean closeRegionMapperOnClose;
-    private final AtomicBuffer buffer = new UnsafeBuffer(0, 0);
+    private final MemoryBufferFlyweight buffer = MemoryBuffers.flyweight();
+    private final boolean readOnly;
     private long mappedPosition;
     private long mappedAddress;
     private boolean closed;
@@ -60,6 +62,7 @@ public final class RegionMappingImpl implements RegionMapping {
     public RegionMappingImpl(final RegionMapper regionMapper, final boolean closeRegionMapperOnClose) {
         validateNotClosed(regionMapper);
         this.regionMapper = requireNonNull(regionMapper);
+        this.readOnly = regionMapper.accessMode() == AccessMode.READ_ONLY;
         this.regionMetrics = new RegionMetricsImpl(regionMapper.regionSize());
         this.closeRegionMapperOnClose = closeRegionMapperOnClose;
         this.mappedPosition = NULL_POSITION;
@@ -103,7 +106,7 @@ public final class RegionMappingImpl implements RegionMapping {
     }
 
     @Override
-    public AtomicBuffer buffer() {
+    public MutableMemoryBuffer buffer() {
         return buffer;
     }
 
@@ -133,12 +136,19 @@ public final class RegionMappingImpl implements RegionMapping {
         return false;
     }
 
+    private void wrapBuffer(final long address, final int length) {
+        buffer.wrap(address, length);
+        if (readOnly) {
+            buffer.makeReadOnly();
+        }
+    }
+
     private boolean map(final long position, final int regionSize) {
         final long addr = regionMapper.map(position);
         if (addr > NULL_ADDRESS) {
             mappedPosition = position;
             mappedAddress = addr;
-            buffer.wrap(addr, regionSize);
+            wrapBuffer(addr, regionSize);
             return true;
         }
         return false;
@@ -151,7 +161,7 @@ public final class RegionMappingImpl implements RegionMapping {
         }
         assert mappedAddr != NULL_ADDRESS : "address cannot be unmapped";
         if (clearState) {
-            buffer.wrap(0, 0);
+            buffer.unwrap();
             mappedPosition = NULL_POSITION;
             mappedAddress = NULL_ADDRESS;
         }

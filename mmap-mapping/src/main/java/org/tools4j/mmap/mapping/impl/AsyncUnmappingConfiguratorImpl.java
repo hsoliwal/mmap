@@ -23,28 +23,26 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
-import org.agrona.concurrent.IdleStrategy;
+import org.tools4j.mmap.core.idle.Idler;
 import org.tools4j.mmap.mapping.api.AsyncRuntime;
 import org.tools4j.mmap.mapping.api.AsyncRuntimeInstances;
 import org.tools4j.mmap.mapping.config.AsyncUnmappingConfig;
 import org.tools4j.mmap.mapping.config.AsyncUnmappingConfigurator;
 import org.tools4j.mmap.mapping.config.SharingPolicy;
 
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import static java.util.Objects.requireNonNull;
-import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultUnmappingRuntimeSupplier;
 import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultUnmappingCacheSize;
+import static org.tools4j.mmap.mapping.config.MappingConfigurations.defaultUnmappingRuntimeSupplier;
 import static org.tools4j.mmap.mapping.impl.AsyncUnmappingConfigDefaults.ASYNC_UNMAPPING_CONFIG_DEFAULTS;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateUnmappingCacheSize;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateUnmappingCacheSize;
 
 public class AsyncUnmappingConfiguratorImpl implements AsyncUnmappingConfigurator {
 
     private final AsyncUnmappingConfig defaults;
     private int unmappingCacheSize;
     private Supplier<? extends AsyncRuntime> unmappingRuntimeSupplier;
-    private static final AtomicInteger unmapperCounter = new AtomicInteger();
 
     public AsyncUnmappingConfiguratorImpl() {
         this(ASYNC_UNMAPPING_CONFIG_DEFAULTS);
@@ -111,16 +109,15 @@ public class AsyncUnmappingConfiguratorImpl implements AsyncUnmappingConfigurato
     }
 
     @Override
-    public AsyncUnmappingConfigurator unmappingRuntimeUsing(final IdleStrategy idleStrategy) {
-        requireNonNull(idleStrategy);
-        return unmappingRuntimeUsing(() -> idleStrategy);
+    public AsyncUnmappingConfigurator unmappingRuntimeUsing(final Idler idler) {
+        requireNonNull(idler);
+        return unmappingRuntimeUsing(() -> idler);
     }
 
     @Override
-    public AsyncUnmappingConfigurator unmappingRuntimeUsing(final Supplier<? extends IdleStrategy> idleStrategy) {
-        requireNonNull(idleStrategy);
-        return unmappingRuntimeSupplier(() -> AsyncRuntime.create(
-                "unmapper-" + unmapperCounter.incrementAndGet(), idleStrategy.get(), true));
+    public AsyncUnmappingConfigurator unmappingRuntimeUsing(final Supplier<? extends Idler> idler) {
+        requireNonNull(idler);
+        return unmappingRuntimeSupplier(() -> AsyncRuntimeInstances.newUnmappingRuntime(idler.get()));
     }
 
     @Override
