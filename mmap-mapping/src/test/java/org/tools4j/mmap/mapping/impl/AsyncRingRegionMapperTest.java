@@ -23,8 +23,6 @@
  */
 package org.tools4j.mmap.mapping.impl;
 
-import org.agrona.DirectBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -33,21 +31,24 @@ import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
 import org.mockito.verification.VerificationMode;
-import org.tools4j.mmap.mapping.api.AsyncRuntime;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
 import org.tools4j.mmap.mapping.api.AsyncRuntime.Recurring;
+import org.tools4j.mmap.mapping.api.AsyncRuntime;
 import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.mapping.api.Mappings;
 import org.tools4j.mmap.mapping.unsafe.FileMapper;
 import org.tools4j.mmap.mapping.unsafe.RegionMapper;
 import org.tools4j.mmap.mapping.unsafe.RegionMappers;
 
-import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
@@ -97,13 +98,13 @@ public class AsyncRingRegionMapperTest {
             asyncRecurringList.remove(invocation.getArgument(0));
             return null;
         }).when(asyncRuntime).deregister(any());
-        final DirectBuffer data = new UnsafeBuffer(ByteBuffer.allocateDirect(MAX_DATA_LENGTH));
-        when(fileMapper.map(anyLong(), eq(regionSize))).thenAnswer(invocation -> {
+        final MutableMemoryBuffer data = MemoryBuffers.allocateDirect(MAX_DATA_LENGTH);
+        when(fileMapper.map(anyLong(), eq(regionSize), anyBoolean())).thenAnswer(invocation -> {
             final long position = invocation.getArgument(0);
             if (position < 0 || position >= MAX_DATA_LENGTH || (position % regionSize) != 0) {
                 return NULL_ADDRESS;
             }
-            return data.addressOffset() + position;
+            return data.address() + position;
         });
         when(fileMapper.mappingLimit()).thenReturn(Long.MAX_VALUE);
         final AtomicBoolean closed = new AtomicBoolean();
@@ -114,7 +115,8 @@ public class AsyncRingRegionMapperTest {
         }).when(fileMapper).close();
         regionMapper = new LoggingRegionMapper(RegionMappers.createAsyncRunAheadRegionMapper(
                 new LoggingFileMapper(fileMapper), regionSize, cacheSize, lruCacheSize, deferUnmap,
-                asyncRuntime, regionsToMapAhead, mapAheadCacheSize, asyncRuntime, unmapCacheSize
+                asyncRuntime, regionsToMapAhead, mapAheadCacheSize, asyncRuntime, unmapCacheSize,
+                LifecycleListener.NO_OP
         ));
         inOrder = Mockito.inOrder(asyncRuntime, fileMapper);
         assertEquals(2, asyncRecurringList.size());
@@ -140,19 +142,19 @@ public class AsyncRingRegionMapperTest {
         asyncRecurringList.forEach(Recurring::execute);
 
         //then: mapped
-        inOrder.verify(fileMapper, once()).map(regionStartPosition, regionSize);
+        inOrder.verify(fileMapper, once()).map(eq(regionStartPosition), eq(regionSize), anyBoolean());
 
         //and: mapped ahead
         for (int i = 0; i < regionsToMapAhead; i++) {
             final long regionPosition = regionStartPosition + (i + 1) * regionSize;
-            inOrder.verify(fileMapper, once()).map(regionPosition, regionSize);
+            inOrder.verify(fileMapper, once()).map(eq(regionPosition), eq(regionSize), anyBoolean());
         }
 
         //when: move to same position
         mapping.moveTo(position);
 
         //then
-        inOrder.verify(fileMapper, never()).map(regionStartPosition, regionSize);
+        inOrder.verify(fileMapper, never()).map(eq(regionStartPosition), eq(regionSize), anyBoolean());
         assertEquals(offsetInRegion, mapping.regionOffset());
         assertEquals(regionSize - offsetInRegion, mapping.bytesAvailable());
 
@@ -161,7 +163,7 @@ public class AsyncRingRegionMapperTest {
         mapping.moveToCurrentRegion(offset);
 
         //then
-        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt());
+        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt(), anyBoolean());
         assertEquals(offset, mapping.regionOffset());
         assertEquals(regionSize - offset, mapping.bytesAvailable());
 
@@ -169,21 +171,22 @@ public class AsyncRingRegionMapperTest {
         mapping.moveTo(regionStartPosition);
 
         //then
-        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt());
+        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt(), anyBoolean());
         assertEquals(0, mapping.regionOffset());
         assertEquals(regionSize, mapping.bytesAvailable());
 
         //when: close
-        final long address = mapping.buffer().addressOffset();
+        final long address = mapping.buffer().address();
         try (final Invoker ignored = startAsyncInvoker()) {
             mapping.close();
         }
 
-        //then: all unmapped
-        inOrder.verify(fileMapper, once()).unmap(regionStartPosition, address, regionSize);
+        //then: all unmapped, in no particular order: the async unmapper unmaps the cached region whenever its thread
+        //gets to it, at the latest when closing, while the regions mapped ahead are unmapped by the closing thread
+        Mockito.verify(fileMapper, once()).unmap(regionStartPosition, address, regionSize);
         for (int i = 0; i < regionsToMapAhead; i++) {
             final long regionPosition = regionStartPosition + (i + 1) * regionSize;
-            inOrder.verify(fileMapper, once()).unmap(eq(regionPosition), anyLong(), eq(regionSize));
+            Mockito.verify(fileMapper, once()).unmap(eq(regionPosition), anyLong(), eq(regionSize));
         }
     }
 
@@ -200,32 +203,33 @@ public class AsyncRingRegionMapperTest {
         asyncRecurringList.forEach(Recurring::execute);
 
         //then
-        inOrder.verify(fileMapper, once()).map(regionStartPosition, regionSize);
+        inOrder.verify(fileMapper, once()).map(eq(regionStartPosition), eq(regionSize), anyBoolean());
         for (int i = 0; i < regionsToMapAhead; i++) {
             final long regionPosition = regionStartPosition + (i + 1) * regionSize;
-            inOrder.verify(fileMapper, once()).map(regionPosition, regionSize);
+            inOrder.verify(fileMapper, once()).map(eq(regionPosition), eq(regionSize), anyBoolean());
         }
 
         //when
         mapping.moveTo(position);
 
         //then
-        inOrder.verify(fileMapper, never()).map(regionStartPosition, regionSize);
+        inOrder.verify(fileMapper, never()).map(eq(regionStartPosition), eq(regionSize), anyBoolean());
 
         //when - map again within the same region and check if had been mapped
         mapping.moveToCurrentRegion(0);
 
         //then
-        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt());
+        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt(), anyBoolean());
 
         //when - close to unmap
-        long address = mapping.buffer().addressOffset();
+        long address = mapping.buffer().address();
         try (final Invoker ignored = startAsyncInvoker()) {
             mapping.close();
         }
 
-        //then
-        inOrder.verify(fileMapper, once()).unmap(regionStartPosition, address, regionSize);
+        //then: the async mapper deregistered before the regions mapped ahead are unmapped, then the async unmapper;
+        //the cached region in no particular order, see map_and_access_data
+        Mockito.verify(fileMapper, once()).unmap(regionStartPosition, address, regionSize);
         inOrder.verify(asyncRuntime, once()).deregister(notNull());
         for (int i = 0; i < regionsToMapAhead; i++) {
             final long regionPosition = regionStartPosition + (i + 1) * regionSize;
@@ -254,14 +258,14 @@ public class AsyncRingRegionMapperTest {
         asyncRecurringList.forEach(Recurring::execute);
 
         //then
-        inOrder.verify(fileMapper, once()).map(regionStartPosition, regionSize);
+        inOrder.verify(fileMapper, once()).map(eq(regionStartPosition), eq(regionSize), anyBoolean());
         inOrder.verify(fileMapper, never()).unmap(anyLong(), anyLong(), anyInt());
 
         //and: map ahead, but backwards as position start is >0
         long regionPosition = regionStartPosition;
         for (int i = 0; i < regionsToMapAhead && regionPosition >= 0; i++) {
             regionPosition -= regionSize;
-            inOrder.verify(fileMapper, once()).map(regionPosition, regionSize);
+            inOrder.verify(fileMapper, once()).map(eq(regionPosition), eq(regionSize), anyBoolean());
         }
         inOrder.verifyNoMoreInteractions();
 
@@ -270,7 +274,7 @@ public class AsyncRingRegionMapperTest {
         asyncRecurringList.forEach(Recurring::execute);
 
         //then
-        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt());
+        inOrder.verify(fileMapper, never()).map(anyLong(), anyInt(), anyBoolean());
         inOrder.verify(fileMapper, never()).unmap(anyLong(), anyLong(), anyInt());
     }
 
@@ -278,34 +282,33 @@ public class AsyncRingRegionMapperTest {
         return Mockito.times(1);
     }
 
-    private class Invoker implements Runnable, AutoCloseable {
-        volatile Thread thread;
-        @Override
-        public void run() {
-            thread = Thread.currentThread();
-            while (thread != null) {
+    private final class Invoker implements AutoCloseable {
+        final Thread thread = new Thread(this::run, "async-invoker");
+        volatile boolean running = true;
+
+        private void run() {
+            while (running) {
                 asyncRecurringList.forEach(Recurring::execute);
             }
         }
 
         @Override
         public void close() {
-            final Thread thread = this.thread;
-            if (thread != null) {
-                this.thread = null;
-                try {
-                    thread.join(1000);
-                } catch (final InterruptedException e) {
-                    //ignore
-                }
+            running = false;
+            try {
+                thread.join(10_000);
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (thread.isAlive()) {
+                throw new AssertionError("Async invoker did not stop within 10 seconds");
             }
         }
     }
+
     Invoker startAsyncInvoker() {
         final Invoker invoker = new Invoker();
-        final Thread thread = new Thread(invoker);
-        thread.setName("async-invoker");
-        thread.start();
+        invoker.thread.start();
         return invoker;
     }
 

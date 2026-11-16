@@ -23,17 +23,28 @@
  */
 package org.tools4j.mmap.mapping.api;
 
-import org.agrona.concurrent.SleepingMillisIdleStrategy;
 import org.junit.jupiter.api.Test;
+import org.tools4j.mmap.core.idle.Idler;
+import org.tools4j.mmap.mapping.config.MappingConfigurations;
 import org.tools4j.mmap.mapping.config.SharingPolicy;
+import org.tools4j.mmap.mapping.impl.ThreadAffinities;
 
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Unit test for {@link AsyncRuntimeInstances}: shared, per-thread and individual runtimes.
@@ -42,6 +53,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * runtimes are created on a separate thread so that the stopped runtime is not seen by other tests.
  */
 class AsyncRuntimeInstancesTest {
+    /** Idler parking for 1 ms, so that test runtimes don't keep a CPU busy */
+    private static Idler parkingIdler() {
+        return Idler.backoff(0, 0, 1_000_000, 1_000_000);
+    }
 
     private static final long STOP_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
     private static final long POLL_INTERVAL_MILLIS = 10;
@@ -77,8 +92,8 @@ class AsyncRuntimeInstancesTest {
     void newRuntimesAreIndividualAndCanBeStopped() throws InterruptedException {
         assertIndividualRuntimes(AsyncRuntimeInstances::newMappingRuntime);
         assertIndividualRuntimes(AsyncRuntimeInstances::newUnmappingRuntime);
-        assertIndividualRuntimes(() -> AsyncRuntimeInstances.newMappingRuntime(new SleepingMillisIdleStrategy(1)));
-        assertIndividualRuntimes(() -> AsyncRuntimeInstances.newUnmappingRuntime(new SleepingMillisIdleStrategy(1)));
+        assertIndividualRuntimes(() -> AsyncRuntimeInstances.newMappingRuntime(parkingIdler()));
+        assertIndividualRuntimes(() -> AsyncRuntimeInstances.newUnmappingRuntime(parkingIdler()));
     }
 
     @Test
@@ -96,12 +111,12 @@ class AsyncRuntimeInstancesTest {
     @Test
     void autoStopOnLastDeregister() throws InterruptedException {
         final AsyncRuntime.Recurring task = () -> 0;
-        final AsyncRuntime autoStop = AsyncRuntimeInstances.newMappingRuntime(new SleepingMillisIdleStrategy(1), true);
+        final AsyncRuntime autoStop = AsyncRuntimeInstances.newMappingRuntime(parkingIdler(), true);
         autoStop.register(task);
         autoStop.deregister(task);
         awaitStopped(autoStop);
 
-        final AsyncRuntime noAutoStop = AsyncRuntimeInstances.newUnmappingRuntime(new SleepingMillisIdleStrategy(1),
+        final AsyncRuntime noAutoStop = AsyncRuntimeInstances.newUnmappingRuntime(parkingIdler(),
                 false);
         try {
             noAutoStop.register(task);
@@ -153,6 +168,79 @@ class AsyncRuntimeInstancesTest {
         thread.start();
         thread.join();
         return runtimes;
+    }
+
+    @Test
+    void newMappingRuntimeCreatesThreadWithThreadFactory() throws InterruptedException {
+        //given
+        final Queue<Thread> threads = new ConcurrentLinkedQueue<>();
+        final ThreadFactory threadFactory = new ThreadFactory() {
+            @Override
+            public Thread newThread(final Runnable runnable) {
+                final Thread thread = new Thread(runnable);
+                threads.add(thread);
+                return thread;
+            }
+
+            @Override
+            public String toString() {
+                return "RecordingThreadFactory";
+            }
+        };
+
+        //when
+        final AsyncRuntime runtime = AsyncRuntimeInstances.newMappingRuntime(parkingIdler(), false,
+                threadFactory);
+
+        //then
+        try {
+            assertEquals(1, threads.size());
+            final Thread thread = threads.peek();
+            assertNotNull(thread);
+            assertTrue(thread.getName().startsWith("mapper-"), thread.getName());
+            assertTrue(thread.isDaemon());
+            assertTrue(runtime.toString().contains("threadFactory=RecordingThreadFactory"), runtime.toString());
+        } finally {
+            runtime.stop(true);
+            awaitStopped(runtime);
+        }
+    }
+
+    @Test
+    void newMappingRuntimeThreadIsPinnedToCpuOfSystemProperty() throws InterruptedException {
+        //given
+        assumeTrue(CpuPinning.isSupported(), "CPU affinity is not supported");
+        final int cpu = ThreadAffinities.currentThreadAffinity()[0];
+        final AsyncRuntime runtime;
+        System.setProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY, String.valueOf(cpu));
+        try {
+            runtime = AsyncRuntimeInstances.newMappingRuntime(parkingIdler(), false);
+        } finally {
+            System.clearProperty(MappingConfigurations.MAPPING_RUNTIME_CPUS_PROPERTY);
+        }
+
+        //when
+        final CountDownLatch executed = new CountDownLatch(1);
+        final AtomicReference<String> threadName = new AtomicReference<>();
+        final AtomicReference<int[]> affinity = new AtomicReference<>();
+        try {
+            runtime.register(() -> {
+                if (executed.getCount() > 0) {
+                    threadName.set(Thread.currentThread().getName());
+                    affinity.set(ThreadAffinities.currentThreadAffinity());
+                    executed.countDown();
+                }
+                return 0;
+            });
+
+            //then
+            assertTrue(executed.await(10, TimeUnit.SECONDS));
+            assertTrue(threadName.get().startsWith("mapper-"), threadName.get());
+            assertArrayEquals(new int[]{cpu}, affinity.get());
+        } finally {
+            runtime.stop(true);
+            awaitStopped(runtime);
+        }
     }
 
     private static void awaitStopped(final AsyncRuntime runtime) throws InterruptedException {

@@ -23,9 +23,8 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
-import org.tools4j.mmap.mapping.api.FileInitialiser;
-import org.tools4j.mmap.mapping.api.Unsafe;
 import org.tools4j.mmap.mapping.config.MappingConfig;
 
 import java.io.File;
@@ -37,27 +36,29 @@ public enum FileMappers {
     ;
     public static FileMapper create(final File file,
                                     final AccessMode accessMode,
-                                    final FileInitialiser fileInitialiser,
                                     final MappingConfig config) {
         switch (accessMode) {
             case READ_ONLY:
                 if (config.rollFiles()) {
                     return isAsyncMapping(config)
-                            ? ConcurrentRollingFileMapper.forReadOnly(file, config, fileInitialiser)
-                            : RollingFileMapper.forReadOnly(file, config, fileInitialiser);
+                            ? ConcurrentRollingFileMapper.forReadOnly(file, config)
+                            : RollingFileMapper.forReadOnly(file, config);
                 }
-                return new ReadOnlyFileMapper(file, fileInitialiser);
+                return new ReadOnlyFileMapper(file, config.fileInitialiser(), config.lifecycleListener(),
+                        config.errorListener());
             case READ_WRITE:
                 if (config.rollFiles()) {
                     return isAsyncMapping(config)
-                            ? ConcurrentRollingFileMapper.forReadWrite(file, accessMode, config, fileInitialiser)
-                            : RollingFileMapper.forReadWrite(file, accessMode, config, fileInitialiser);
+                            ? ConcurrentRollingFileMapper.forReadWrite(file, accessMode, config)
+                            : RollingFileMapper.forReadWrite(file, accessMode, config);
                 }
                 if (config.expandFile()) {
                     return new ExpandableSizeFileMapper(file, config.minFileSize(), config.maxFileSize(),
-                            config.regionSize(), fileInitialiser);
+                            config.regionSize(), config.fileInitialiser(), config.lifecycleListener(),
+                            config.errorListener());
                 }
-                return new FixedSizeFileMapper(file, config.maxFileSize(), accessMode, fileInitialiser);
+                return new FixedSizeFileMapper(file, config.maxFileSize(), accessMode, config.fileInitialiser(),
+                        config.lifecycleListener(), config.errorListener());
             default:
                 throw new IllegalArgumentException("Unsupported access mode: " + accessMode);
         }

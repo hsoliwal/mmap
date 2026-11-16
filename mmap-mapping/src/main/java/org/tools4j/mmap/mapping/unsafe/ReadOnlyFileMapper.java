@@ -23,20 +23,24 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.config.CoreConfigurations;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.FileInitialiser;
-import org.tools4j.mmap.mapping.api.Unsafe;
+import org.tools4j.mmap.mapping.config.MappingConfigurations;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 
 import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.Validations.validateNotClosed;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
 
 /**
  * A {@link FileMapper} for read-only access to an existing file.
@@ -45,16 +49,24 @@ import static org.tools4j.mmap.mapping.impl.Constraints.validateNotClosed;
  * multiple threads.
  */
 @Unsafe
-public class ReadOnlyFileMapper implements FileMapper {
-    private static final Logger LOGGER = LoggerFactory.getLogger(ReadOnlyFileMapper.class);
+public class ReadOnlyFileMapper implements FileMapper, Describable {
 
     private final File file;
     private final FileChannelProvider fileChannelProvider;
     private volatile long fileSizeCache;
 
     public ReadOnlyFileMapper(final File file, final FileInitialiser fileInitialiser) {
+        this(file, fileInitialiser, MappingConfigurations.defaultLifecycleListener(),
+                CoreConfigurations.defaultErrorListener());
+    }
+
+    public ReadOnlyFileMapper(final File file,
+                              final FileInitialiser fileInitialiser,
+                              final LifecycleListener lifecycleListener,
+                              final ErrorListener errorListener) {
         this.file = requireNonNull(file);
-        this.fileChannelProvider = new FileChannelProvider(this, file, fileInitialiser);
+        this.fileChannelProvider = new FileChannelProvider(this, AccessMode.READ_ONLY, file, fileInitialiser, 0,
+                lifecycleListener, errorListener);
     }
 
     public ReadOnlyFileMapper(final String fileName, final FileInitialiser fileInitialiser) {
@@ -67,7 +79,7 @@ public class ReadOnlyFileMapper implements FileMapper {
     }
 
     @Override
-    public long map(long position, int length) {
+    public long map(final long position, final int length, final boolean preTouch) {
         assert position >= 0;
         assert length >= 0;
         //NOTE: relying on fileChannelProvider's closed check
@@ -82,9 +94,9 @@ public class ReadOnlyFileMapper implements FileMapper {
             }
             return FileChannels.map(channel, AccessMode.READ_ONLY.mapMode(), position, length);
         } catch (final IOException e) {
-            LOGGER.error("Failed to map file {}", file, e);
+            throw new UncheckedIOException("Failed to map position " + position + " with length " + length +
+                    " of file " + file, e);
         }
-        return NULL_ADDRESS;
     }
 
     /**
@@ -113,15 +125,18 @@ public class ReadOnlyFileMapper implements FileMapper {
 
     @Override
     public void close() {
-        if (fileChannelProvider.closeIfNeeded()) {
-            LOGGER.info("Closed: {}", this);
-        }
+        fileChannelProvider.closeIfNeeded();
+    }
+
+    @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("ReadOnlyFileMapper")
+                .append(":file=").append(file.getPath())
+                .append("|closed=").append(isClosed());
     }
 
     @Override
     public String toString() {
-        return "ReadOnlyFileMapper" +
-                ":file=" + file +
-                "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 }

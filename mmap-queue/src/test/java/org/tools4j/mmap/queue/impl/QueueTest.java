@@ -23,10 +23,12 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.ExpandableDirectByteBuffer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.tools4j.mmap.core.buffer.MemoryBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
 import org.tools4j.mmap.mapping.api.OpenMode;
 import org.tools4j.mmap.queue.api.Appender;
 import org.tools4j.mmap.queue.api.AppendingContext;
@@ -42,7 +44,6 @@ import org.tools4j.mmap.queue.api.Queue;
 import org.tools4j.mmap.queue.api.ReadingContext;
 import org.tools4j.mmap.queue.config.MappingStrategy;
 import org.tools4j.mmap.queue.config.QueueConfig;
-import org.tools4j.mmap.queue.util.FileUtil;
 
 import java.io.File;
 import java.io.IOException;
@@ -70,7 +71,7 @@ class QueueTest {
     @AfterEach
     void tearDown() {
         try {
-            FileUtil.deleteRecursively(tempDir.toFile());
+            TempFiles.deleteRecursively(tempDir.toFile());
         } catch (final IOException e) {
             System.err.println("Deleting temp files failed: tempDir=" + tempDir + ", e=" + e);
         }
@@ -295,7 +296,7 @@ class QueueTest {
 
                 //when
                 try (final IterableContext fwd = iterator1.readingFrom(Index.END);
-                     final IterableContext bwd = iterator2.readingFrom(Index.END).reverse()) {
+                     final IterableContext bwd = iterator2.readingFrom(Index.END).backward()) {
                     assertThat(iterateAndCount(fwd)).isEqualTo(0);
                     assertThat(iterateAndCount(bwd)).isEqualTo(0);
                     append(appender, "1 more");
@@ -309,10 +310,17 @@ class QueueTest {
         }
     }
 
+    /** Appends the string with a length prefix */
     private static long append(final Appender appender, final String string) {
-        final ExpandableDirectByteBuffer buffer = new ExpandableDirectByteBuffer();
-        final int len = buffer.putStringUtf8(0, string);
-        return appender.append(buffer, 0, len);
+        final MutableMemoryBuffer buffer = MemoryBuffers.expandable(Integer.BYTES);
+        final int len = buffer.putTextUtf8(Integer.BYTES, string);
+        buffer.putInt(0, len);
+        return appender.append(buffer, 0, Integer.BYTES + len);
+    }
+
+    /** Reads a string with a length prefix */
+    private static String text(final MemoryBuffer buffer, final int index) {
+        return buffer.getTextUtf8(index + Integer.BYTES, buffer.getInt(index));
     }
 
     private static long appendZeroLengthEntry(final Appender appender) {
@@ -324,7 +332,7 @@ class QueueTest {
      private String poll(final Poller poller, final long expectedIndex) {
         final AtomicReference<String> stringValue = new AtomicReference<>(null);
         poll(poller, expectedIndex, (idx, buf, off, len) -> {
-            stringValue.set(buf.getStringUtf8(off));
+            stringValue.set(text(buf, off));
             return Move.NEXT;
         });
         return stringValue.get();
@@ -359,7 +367,7 @@ class QueueTest {
                     if (index <= Index.MAX) {
                         assertThat(context.index()).isEqualTo(index);
                     }
-                    return context.buffer().getStringUtf8(0);
+                    return text(context.buffer(), 0);
                 }
             }
         }
@@ -391,8 +399,8 @@ class QueueTest {
     private String iterateAndGetFirst(final EntryIterator iterator, final boolean forward, final long index) {
         for (int i = 0; i < MAX_READ_ATTEMPTS; i++) {
             try (final IterableContext context = iterator.readingFrom(index)) {
-                for (final Entry entry : (forward ? context : context.reverse())) {
-                    return entry.buffer().getStringUtf8(0);
+                for (final Entry entry : (forward ? context : context.backward())) {
+                    return text(entry.buffer(), 0);
                 }
             }
         }
@@ -403,9 +411,9 @@ class QueueTest {
         for (int i = 0; i < MAX_READ_ATTEMPTS; i++) {
             try (final IterableContext context = iterator.readingFrom(index)) {
                 String value = null;
-                for (final Entry entry : (forward ? context : context.reverse())) {
+                for (final Entry entry : (forward ? context : context.backward())) {
                     if (entry.buffer().capacity() >= Integer.BYTES) {
-                        value = entry.buffer().getStringUtf8(0);
+                        value = text(entry.buffer(), 0);
                     }
                 }
                 if (value != null) {
@@ -420,7 +428,7 @@ class QueueTest {
         for (int i = 0; i < MAX_READ_ATTEMPTS; i++) {
             try (final IterableContext context = iterator.readingFrom(index)) {
                 int count = 0;
-                for (final Entry ignored : (forward ? context : context.reverse())) {
+                for (final Entry ignored : (forward ? context : context.backward())) {
                     count++;
                 }
                 if (count > 0) {

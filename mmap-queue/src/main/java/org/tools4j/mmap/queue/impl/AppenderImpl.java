@@ -23,14 +23,13 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.BitUtil;
-import org.agrona.CloseHelper;
-import org.agrona.DirectBuffer;
-import org.agrona.MutableDirectBuffer;
-import org.agrona.concurrent.AtomicBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.buffer.MemoryBuffer;
+import org.tools4j.mmap.core.buffer.MemoryBufferFlyweight;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
+import org.tools4j.mmap.core.internal.Closeables;
 import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.queue.api.Appender;
 import org.tools4j.mmap.queue.api.AppendingContext;
@@ -39,14 +38,14 @@ import org.tools4j.mmap.queue.api.Index;
 import java.nio.ByteBuffer;
 
 import static java.util.Objects.requireNonNull;
+import static org.tools4j.mmap.core.internal.PowersOfTwo.ceilingPowerOfTwo;
 import static org.tools4j.mmap.queue.impl.Exceptions.headerMoveException;
 import static org.tools4j.mmap.queue.impl.Exceptions.payloadMoveException;
 import static org.tools4j.mmap.queue.impl.Exceptions.payloadPositionExceedsMaxException;
 import static org.tools4j.mmap.queue.impl.Headers.MAX_PAYLOAD_POSITION;
 import static org.tools4j.mmap.queue.impl.Headers.NULL_HEADER;
 
-final class AppenderImpl implements Appender {
-    private static final Logger LOGGER = LoggerFactory.getLogger(AppenderImpl.class);
+final class AppenderImpl implements Appender, Describable {
 
     private final String queueName;
     private final AppenderMappings mappings;
@@ -55,12 +54,14 @@ final class AppenderImpl implements Appender {
     private final ElasticMapping payload;
     private final AppendingContextImpl context;
     private final Runnable onClose;
+    private final LifecycleListener lifecycleListener;
     private long endIndex;
     private long lastOwnHeader;
     private int lastOwnPayloadLength;
     private boolean closed;
 
-    public AppenderImpl(final String queueName, final AppenderMappings mappings, final Runnable onClose) {
+    public AppenderImpl(final String queueName, final AppenderMappings mappings, final Runnable onClose,
+                        final LifecycleListener lifecycleListener) {
         try {
             this.queueName = requireNonNull(queueName);
             this.mappings = requireNonNull(mappings);
@@ -69,14 +70,16 @@ final class AppenderImpl implements Appender {
             this.payload = requireNonNull(mappings.payload());
             this.context = new AppendingContextImpl(this);
             this.onClose = requireNonNull(onClose);
+            this.lifecycleListener = requireNonNull(lifecycleListener);
             this.endIndex = Index.NULL;
             this.lastOwnHeader = NULL_HEADER;
             this.lastOwnPayloadLength = -1;
             initialMoveToEnd();
         } catch (final Throwable t) {
-            CloseHelper.quietClose(mappings);
+            Closeables.closeOnFailure(mappings, t);
             throw t;
         }
+        lifecycleListener.onOpened(this);
     }
 
     private void checkIndexNotExceedingMax(final long index) {
@@ -85,13 +88,18 @@ final class AppenderImpl implements Appender {
         }
     }
 
-    /** Linear move to end while also remembering the last of our own headers */
+    /**
+     * Move to end while also finding the last of our own headers: binary search of the last entry, backward scan to
+     * our last own entry unless our ID has none, then forward scan to the end, which may have moved since the binary
+     * search if other appenders appended concurrently
+     */
     private void initialMoveToEnd() {
         final ElasticMapping hdr = header;
         //noinspection UnnecessaryLocalVariable
         final int ownAppenderId = appenderId;
-        long endIndex = Index.FIRST;
-        long lastOwnHeader = NULL_HEADER;
+        final long lastIndex = Headers.binarySearchLastIndex(hdr, Index.FIRST);
+        long lastOwnHeader = mappings.payloadFileExisted() ? lastOwnHeaderBackwardFrom(lastIndex) : NULL_HEADER;
+        long endIndex = lastIndex + 1;
         long header;
         while ((header = Headers.moveAndGetHeader(hdr, endIndex)) != NULL_HEADER) {
             endIndex++;
@@ -103,6 +111,16 @@ final class AppenderImpl implements Appender {
         this.endIndex = endIndex;
         this.lastOwnHeader = lastOwnHeader;
         this.lastOwnPayloadLength = lastOwnHeader == NULL_HEADER ? -1 : payloadLength(lastOwnHeader);
+    }
+
+    private long lastOwnHeaderBackwardFrom(final long lastIndex) {
+        for (long index = lastIndex; index >= Index.FIRST; index--) {
+            final long header = Headers.moveAndGetHeader(this.header, index);
+            if (header != NULL_HEADER && Headers.appenderId(header) == appenderId) {
+                return header;
+            }
+        }
+        return NULL_HEADER;
     }
 
     /**
@@ -153,7 +171,7 @@ final class AppenderImpl implements Appender {
     }
 
     @Override
-    public long append(final DirectBuffer buffer, final int offset, final int length) {
+    public long append(final MemoryBuffer buffer, final int offset, final int length) {
         try (final AppendingContext context = appending(length)) {
             context.buffer().putBytes(0, buffer, offset, length);
             return context.commit(length);
@@ -169,22 +187,23 @@ final class AppenderImpl implements Appender {
     private long appendEntry(final long payloadPosition, final int payloadLength) {
         checkNotClosed();
         final ElasticMapping hdr = header;
-        final AtomicBuffer buf = hdr.buffer();
+        final MutableMemoryBuffer buf = hdr.buffer();
         final long headerValue = Headers.header(appenderId, payloadPosition);
         long index = endIndex;
         checkIndexNotExceedingMax(index);
         while (!buf.compareAndSetLong(0, NULL_HEADER, headerValue)) {
             do {
                 index++;
-                endIndex = index;
                 checkIndexNotExceedingMax(index);
                 if (!Headers.moveToHeaderIndex(hdr, index)) {
                     throw headerMoveException(this, Headers.headerPositionForIndex(index));
                 }
+                //NOTE: only after a successful move, endIndex must always be where hdr is mapped
+                endIndex = index;
             } while (buf.getLongAcquire(0) != NULL_HEADER);
         }
         final long nextIndex = index + 1;
-        if (nextIndex <= Index.MAX && Headers.moveToHeaderIndex(hdr, nextIndex)) {
+        if (nextIndex <= Index.MAX && tryMoveToHeaderIndexAfterCommit(hdr, nextIndex)) {
             endIndex = nextIndex;
         }
         //else: leave endIndex at `index` (already durably claimed) and hdr mapped there too - the next append's own
@@ -194,6 +213,18 @@ final class AppenderImpl implements Appender {
         lastOwnHeader = headerValue;
         lastOwnPayloadLength = payloadLength;
         return index;
+    }
+
+    /**
+     * Pre-positions the header after the entry has been committed, which must not throw: a failed move leaves the
+     * header where it is, and the next append repeats the move and gets the error.
+     */
+    private static boolean tryMoveToHeaderIndexAfterCommit(final ElasticMapping hdr, final long index) {
+        try {
+            return Headers.moveToHeaderIndex(hdr, index);
+        } catch (final RuntimeException e) {
+            return false;
+        }
     }
 
     private void checkNotClosed() {
@@ -216,7 +247,7 @@ final class AppenderImpl implements Appender {
             lastOwnPayloadLength = -1;
             mappings.close();
             onClose.run();
-            LOGGER.info("Appender closed: {}", appenderName());
+            lifecycleListener.onClosed(this);
         }
     }
 
@@ -225,10 +256,10 @@ final class AppenderImpl implements Appender {
         final AppenderImpl appender;
         final ElasticMapping payload;
         final int maxEntrySize;
-        final MutableDirectBuffer buffer = new UnsafeBuffer(0, 0);
+        final MemoryBufferFlyweight buffer = MemoryBuffers.flyweight();
         int maxLength = -1;
         /** Lazily allocated to copy encoded data to the next region if the previous region is not kept mapped */
-        UnsafeBuffer copyBuffer;
+        MutableMemoryBuffer copyBuffer;
 
         AppendingContextImpl(final AppenderImpl appender) {
             this.appender = requireNonNull(appender);
@@ -302,7 +333,7 @@ final class AppenderImpl implements Appender {
                     //      --> old region address is still mapped because the region cache defers unmapping
                     buffer.getBytes(0, pld.buffer(), Integer.BYTES, max);
                 } else {
-                    final UnsafeBuffer copy = copyBuffer(max);
+                    final MutableMemoryBuffer copy = copyBuffer(max);
                     buffer.getBytes(0, copy, 0, max);
                     moveToNextPayloadRegion(pld);
                     copy.getBytes(0, pld.buffer(), Integer.BYTES, max);
@@ -312,17 +343,17 @@ final class AppenderImpl implements Appender {
             maxLength = capacity;
         }
 
-        private UnsafeBuffer copyBuffer(final int length) {
-            final UnsafeBuffer copy = copyBuffer;
+        private MutableMemoryBuffer copyBuffer(final int length) {
+            final MutableMemoryBuffer copy = copyBuffer;
             if (copy != null && copy.capacity() >= length) {
                 return copy;
             }
-            final int capacity = BitUtil.findNextPositivePowerOfTwo(Math.max(MIN_COPY_BUFFER_CAPACITY, length));
-            return copyBuffer = new UnsafeBuffer(ByteBuffer.allocateDirect(capacity));
+            final int capacity = ceilingPowerOfTwo(Math.max(MIN_COPY_BUFFER_CAPACITY, length));
+            return copyBuffer = MemoryBuffers.allocateDirect(capacity);
         }
 
         @Override
-        public MutableDirectBuffer buffer() {
+        public MutableMemoryBuffer buffer() {
             return buffer;
         }
 
@@ -335,7 +366,7 @@ final class AppenderImpl implements Appender {
         public long commit(final int length) {
             final int max = maxLength;
             maxLength = -1;
-            buffer.wrap(0, 0);
+            buffer.unwrap();
             validateLength(length, max);
             final ElasticMapping pld = payload;
             pld.buffer().putInt(0, length);
@@ -372,8 +403,16 @@ final class AppenderImpl implements Appender {
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("AppenderImpl")
+                .append(":queue=").append(queueName)
+                .append("|appenderId=").append(appenderId)
+                .append("|closed=").append(closed);
+    }
+
+    @Override
     public String toString() {
-        return "AppenderImpl:queue=" + queueName + "|appenderId=" + appenderId + "|closed=" + closed;
+        return Describable.describe(this);
     }
 
 }

@@ -23,45 +23,50 @@
  */
 package org.tools4j.mmap.queue.impl;
 
-import org.agrona.CloseHelper;
-import org.agrona.DirectBuffer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.buffer.MemoryBuffer;
+import org.tools4j.mmap.core.internal.Closeables;
+import org.tools4j.mmap.mapping.api.ElasticMapping;
 import org.tools4j.mmap.queue.api.EntryHandler;
 import org.tools4j.mmap.queue.api.Index;
 import org.tools4j.mmap.queue.api.Poller;
-import org.tools4j.mmap.mapping.api.ElasticMapping;
 
 import static java.util.Objects.requireNonNull;
 import static org.tools4j.mmap.queue.impl.Exceptions.invalidIndexException;
 import static org.tools4j.mmap.queue.impl.Exceptions.payloadMoveException;
 import static org.tools4j.mmap.queue.impl.Headers.NULL_HEADER;
 
-final class PollerImpl implements Poller {
-    private static final Logger LOGGER = LoggerFactory.getLogger(PollerImpl.class);
+final class PollerImpl implements Poller, Describable {
 
     private final String queueName;
     private final ReaderMappings mappings;
-    private final ElasticMapping header;
     private final Runnable onClose;
+    private final LifecycleListener lifecycleListener;
+    private final ErrorListener errorListener;
     private long nextIndex;
     private long currentIndex;
     private long currentHeader;
     private int errorState = PENDING_OPEN;
 
-    PollerImpl(final String queueName, final ReaderMappings mappings, final Runnable onClose) {
+    PollerImpl(final String queueName, final ReaderMappings mappings, final Runnable onClose,
+               final LifecycleListener lifecycleListener,
+               final ErrorListener errorListener) {
         try {
             this.queueName = requireNonNull(queueName);
             this.mappings = requireNonNull(mappings);
-            this.header = requireNonNull(mappings.header());
             this.onClose = requireNonNull(onClose);
+            this.lifecycleListener = requireNonNull(lifecycleListener);
+            this.errorListener = requireNonNull(errorListener);
             this.nextIndex = Index.FIRST;
             this.currentIndex = Index.NULL;
             this.currentHeader = NULL_HEADER;
         } catch (final Throwable t) {
-            CloseHelper.quietClose(mappings);
+            Closeables.closeOnFailure(mappings, t);
             throw t;
         }
+        lifecycleListener.onOpened(this);
     }
 
     @Override
@@ -105,7 +110,7 @@ final class PollerImpl implements Poller {
     public int poll(final EntryHandler entryHandler) {
         requireNonNull(entryHandler);
         int result = UNKNOWN_ERROR;
-        long index = Index.NULL;
+        final long index;
         final long moveNext;
         try {
             result = moveHeaderToNext();
@@ -113,19 +118,16 @@ final class PollerImpl implements Poller {
                 return result;
             }
             index = currentIndex;
-            final DirectBuffer buffer = payloadBuffer();
+            final MemoryBuffer buffer = payloadBuffer();
             final int length = buffer.getInt(0);
             result = HANDLER_ERROR;
             moveNext = entryHandler.onEntry(index, buffer, Integer.BYTES, length);
         } catch (final Exception e) {
-            //TODO consider throttling of error logging inside poll method
             if (result == HANDLER_ERROR) {
-                LOGGER.error("Unexpected exception thrown by entry handler for message entry {} of queue {}", index,
-                        queueName, e);
+                errorListener.onError(this, "Unexpected exception thrown by entry handler", e);
                 return HANDLER_ERROR;
             } else {
-                final long ix = result == ENTRY_POLLED ? index : nextIndex;
-                LOGGER.error("Unexpected exception occurred when polling entry {} of queue {}", ix, queueName, e);
+                errorListener.onError(this, "Unexpected exception when polling", e);
                 return UNKNOWN_ERROR;
             }
         }
@@ -133,7 +135,7 @@ final class PollerImpl implements Poller {
         return ENTRY_POLLED;
     }
 
-    private DirectBuffer payloadBuffer() {
+    private MemoryBuffer payloadBuffer() {
         final long header = currentHeader;
         final int appenderId = Headers.appenderId(header);
         final long payloadPosition = Headers.payloadPosition(header);
@@ -166,8 +168,8 @@ final class PollerImpl implements Poller {
         }
         final long index = curIndex + inc;
         final long position = Headers.headerPositionForIndex(index);
-        final ElasticMapping headerMapping = this.header;
-        if (!headerMapping.moveTo(position)) {
+        final ElasticMapping headerMapping = mappings.header();
+        if (headerMapping == null || !headerMapping.moveTo(position)) {
             return error;
         }
         if (error == PENDING_OPEN) {
@@ -211,7 +213,7 @@ final class PollerImpl implements Poller {
             currentHeader = NULL_HEADER;
             mappings.close();
             onClose.run();
-            LOGGER.info("Poller closed: {}", pollerName());
+            lifecycleListener.onClosed(this);
         }
     }
 
@@ -233,8 +235,16 @@ final class PollerImpl implements Poller {
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("PollerImpl")
+                .append(":queue=").append(queueName)
+                .append("|currentIndex=").append(currentIndex)
+                .append("|nextIndex=").append(nextIndex)
+                .append("|closed=").append(isClosed());
+    }
+
+    @Override
     public String toString() {
-        return "PollerImpl:queue=" + queueName + "|currentIndex=" + currentIndex + "|nextIndex=" + nextIndex +
-                "|closed=" + isClosed();
+        return Describable.describe(this);
     }
 }

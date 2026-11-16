@@ -23,6 +23,8 @@
  */
 package org.tools4j.mmap.queue.config;
 
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
 
 /**
  * Queue configuration, consisting of the {@link QueueLayoutConfig queue layout}, which is fixed when the queue is
@@ -49,22 +51,93 @@ public interface QueueConfig extends QueueLayoutConfig {
      */
     int maxAppenders();
 
+    /**
+     * Returns the configuration used for appenders created without an explicit configuration.
+     *
+     * @return the default appender configuration of this queue
+     */
     AppenderConfig appenderConfig();
+
+    /**
+     * Returns the configuration used for pollers created without an explicit configuration.
+     *
+     * @return the default poller configuration of this queue
+     */
     ReaderConfig pollerConfig();
+
+    /**
+     * Returns the configuration used for entry readers created without an explicit configuration.
+     *
+     * @return the default entry reader configuration of this queue
+     */
     ReaderConfig entryReaderConfig();
+
+    /**
+     * Returns the configuration used for entry iterators created without an explicit configuration.
+     *
+     * @return the default entry iterator configuration of this queue
+     */
     ReaderConfig entryIteratorConfig();
+
+    /**
+     * Returns the configuration used for index readers created without an explicit configuration.
+     *
+     * @return the default index reader configuration of this queue
+     */
     IndexReaderConfig indexReaderConfig();
 
+    /**
+     * Returns the listener for lifecycle events of the queue, its appenders and readers, and of the files and other
+     * resources they use. It is not part of the queue layout. The default is defined by system property, see
+     * {@link QueueConfigurations#defaultLifecycleListener()}.
+     *
+     * @return the lifecycle listener
+     */
+    LifecycleListener lifecycleListener();
+
+    /**
+     * Returns the listener for errors that cannot be thrown to the caller, such as exceptions thrown by entry handlers
+     * of pollers, and for warnings. It is not part of the queue layout. The default is defined by system property,
+     * see {@link org.tools4j.mmap.core.config.CoreConfigurations#defaultErrorListener()}.
+     *
+     * @return the error listener
+     */
+    ErrorListener errorListener();
+
+    /**
+     * Returns an immutable snapshot of this configuration, or this configuration itself if it is immutable already.
+     *
+     * @return an immutable queue configuration with the values of this configuration
+     */
     QueueConfig toImmutableQueueConfig();
 
+    /**
+     * Returns a new configurator to build a queue configuration, with values not set explicitly taken from the
+     * {@link #getDefault() default} configuration.
+     *
+     * @return a new queue configurator
+     */
     static QueueConfigurator configure() {
         return QueueConfigurator.configure();
     }
 
+    /**
+     * Returns a new configurator to build a queue configuration, with values not set explicitly taken from the given
+     * defaults.
+     *
+     * @param defaults the configuration providing values not set explicitly
+     * @return a new queue configurator
+     */
     static QueueConfigurator configure(final QueueConfig defaults) {
         return QueueConfigurator.configure(defaults);
     }
 
+    /**
+     * Returns the default queue configuration, with values defined through system properties.
+     *
+     * @return the default queue configuration
+     * @see QueueConfigurations
+     */
     static QueueConfig getDefault() {
         return QueueConfigurations.defaultQueueConfig();
     }

@@ -1,0 +1,188 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2016-2026 tools4j.org (Marco Terzer, Anton Anufriev)
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package org.tools4j.mmap.core.buffer;
+
+import org.tools4j.mmap.core.buffer.impl.MemoryBufferImpl;
+
+/**
+ * Creates buffers and flyweights, each with its {@link MemoryBinding}:
+ * <ul>
+ *     <li>{@link MemoryBinding#WRAPPABLE WRAPPABLE}: {@link #flyweight()}, wrapping any memory, as often as needed,
+ *     without allocating</li>
+ *     <li>{@link MemoryBinding#FIXED FIXED}: {@link #allocate(int)}, {@link #allocateDirect(int)},
+ *     {@link #allocateDirect(int, int)}, {@link #wrap(long[])}, {@link #wrap(long[], int, int)}, and
+ *     {@link #EMPTY}</li>
+ *     <li>{@link MemoryBinding#EXPANDABLE EXPANDABLE}: {@link #expandable(int)}, {@link #expandableDirect(int)},
+ *     {@link #expandableDirect(int, int)}</li>
+ * </ul>
+ * <p>
+ * All buffers are instances of one internal class, so that call sites using them stay monomorphic, whatever memory
+ * they access. Which mechanism accesses the memory is chosen once per JVM, see {@link MemoryAccessMode}. Only
+ * {@linkplain MemoryBinding#WRAPPABLE flyweights} can be wrapped and unwrapped: the other buffers throw
+ * {@link UnsupportedOperationException}, even when cast to {@link MemoryBufferFlyweight}.
+ */
+public enum MemoryBuffers {
+    ;
+
+    /** The null address, invalid for direct memory. */
+    public static final long NULL_ADDRESS = 0;
+
+    /**
+     * A {@linkplain MemoryBinding#FIXED fixed} buffer with capacity 0, which cannot be wrapped, not even after a cast
+     * to {@link MemoryBufferFlyweight}, so that it can be shared, e.g. as the buffer of something not ready for data
+     * access.
+     */
+    public static final MutableMemoryBuffer EMPTY = MemoryBufferImpl.empty();
+
+    /**
+     * Returns a new {@linkplain MemoryBinding#WRAPPABLE wrappable} flyweight, initially wrapping no memory, see
+     * {@link MemoryBufferFlyweight#unwrap()}.
+     *
+     * @return the flyweight
+     */
+    public static MemoryBufferFlyweight flyweight() {
+        return MemoryBufferImpl.flyweight();
+    }
+
+    /**
+     * Allocates a {@linkplain MemoryBinding#FIXED fixed} heap buffer backed by a {@code long[]}, which supports ordered
+     * access and atomic operations.
+     *
+     * @param capacity the capacity in bytes, rounded up to a multiple of 8 for the array, but not for the buffer
+     * @return the buffer, zeroed
+     */
+    public static MutableMemoryBuffer allocate(final int capacity) {
+        return MemoryBufferImpl.allocate(capacity);
+    }
+
+    /**
+     * Returns a new {@linkplain MemoryBinding#FIXED fixed} heap buffer over an existing {@code long[]}, sharing it
+     * without copying, which supports ordered access and atomic operations like an {@linkplain #allocate(int)
+     * allocated} heap buffer.
+     * <p>
+     * Unlike wrapping a flyweight, this allocates: the buffer, and for some memory access mechanisms its view of the
+     * array. To access ranges of the array without allocating, wrap flyweights around the returned buffer.
+     *
+     * @param array the array, with a capacity of 8 bytes per element
+     * @return the buffer
+     * @throws IllegalArgumentException if the array has more than {@code Integer.MAX_VALUE / 8} elements
+     */
+    public static MutableMemoryBuffer wrap(final long[] array) {
+        return MemoryBufferImpl.wrap(array, 0, array.length);
+    }
+
+    /**
+     * Returns a new {@linkplain MemoryBinding#FIXED fixed} heap buffer over a range of elements of an existing
+     * {@code long[]}, sharing it without copying, which supports ordered access and atomic operations like an
+     * {@linkplain #allocate(int) allocated} heap buffer. Index 0 of the buffer is the first byte of element
+     * {@code offset}, and the capacity is 8 bytes per element.
+     * <p>
+     * Unlike wrapping a flyweight, this allocates: the buffer, and for some memory access mechanisms its view of the
+     * array. To access ranges of the array without allocating, also ranges not starting at an element, wrap
+     * flyweights around the returned buffer.
+     *
+     * @param array the array
+     * @param offset the index of the first element
+     * @param length the number of elements
+     * @return the buffer
+     * @throws IndexOutOfBoundsException if the range is not within the array
+     * @throws IllegalArgumentException if the range has more than {@code Integer.MAX_VALUE / 8} elements
+     */
+    public static MutableMemoryBuffer wrap(final long[] array, final int offset, final int length) {
+        return MemoryBufferImpl.wrap(array, offset, length);
+    }
+
+    /**
+     * Allocates a {@linkplain MemoryBinding#FIXED fixed} direct buffer whose first byte is aligned to 8 bytes, as
+     * ordered access to longs needs, freed by the garbage collector once the buffer is no longer referenced.
+     * <p>
+     * Allocates the capacity, since the system allocator aligns memory to 16 bytes on 64-bit platforms; otherwise it
+     * allocates again with 7 bytes more, leaving the first allocation to the garbage collector.
+     *
+     * @param capacity the capacity in bytes
+     * @return the buffer, zeroed
+     */
+    public static MutableMemoryBuffer allocateDirect(final int capacity) {
+        return MemoryBufferImpl.allocateDirect(capacity);
+    }
+
+    /**
+     * Allocates a {@linkplain MemoryBinding#FIXED fixed} direct buffer whose first byte is aligned to the given
+     * alignment, e.g. to a cache line, so that padding keeps values written by different threads on different cache
+     * lines, or to a page, freed by the garbage collector once the buffer is no longer referenced.
+     * <p>
+     * Allocates {@code alignment - 1} bytes more than the capacity for an alignment above 16; up to 16, which the
+     * system allocator provides on 64-bit platforms, it allocates the capacity, and otherwise allocates again with
+     * {@code alignment - 1} bytes more, leaving the first allocation to the garbage collector.
+     *
+     * @param capacity the capacity in bytes
+     * @param alignment the alignment in bytes, a positive multiple of 8, the alignment of all direct buffers
+     * @return the buffer, zeroed
+     * @throws IllegalArgumentException if the alignment is not a positive multiple of 8, or the capacity is
+     *                                  negative or too large to allocate with the alignment
+     */
+    public static MutableMemoryBuffer allocateDirect(final int capacity, final int alignment) {
+        return MemoryBufferImpl.allocateDirect(capacity, alignment);
+    }
+
+    /**
+     * Allocates an {@linkplain MemoryBinding#EXPANDABLE expandable} heap buffer backed by a {@code long[]}, growing on
+     * writes beyond its capacity.
+     *
+     * @param initialCapacity the initial capacity in bytes
+     * @return the buffer, zeroed
+     */
+    public static MutableMemoryBuffer expandable(final int initialCapacity) {
+        return MemoryBufferImpl.expandable(initialCapacity);
+    }
+
+    /**
+     * Allocates an {@linkplain MemoryBinding#EXPANDABLE expandable} direct buffer aligned to 8 bytes, also after
+     * growing, growing on writes beyond its capacity; growing moves its memory, so flyweights wrapping it see the old
+     * memory. Allocates like {@link #allocateDirect(int)}, initially and on each growth.
+     *
+     * @param initialCapacity the initial capacity in bytes
+     * @return the buffer, zeroed
+     */
+    public static MutableMemoryBuffer expandableDirect(final int initialCapacity) {
+        return MemoryBufferImpl.expandableDirect(initialCapacity);
+    }
+
+    /**
+     * Allocates an {@linkplain MemoryBinding#EXPANDABLE expandable} direct buffer whose first byte is aligned to the
+     * given alignment, also after growing, e.g. to a cache line, growing on writes beyond its capacity; growing moves
+     * its memory, so flyweights wrapping it see the old memory.
+     * <p>
+     * Allocates like {@link #allocateDirect(int, int)}, initially and on each growth.
+     *
+     * @param initialCapacity the initial capacity in bytes
+     * @param alignment the alignment in bytes, a positive multiple of 8, the alignment of all direct buffers
+     * @return the buffer, zeroed
+     * @throws IllegalArgumentException if the alignment is not a positive multiple of 8, or the initial
+     *                                  capacity is negative or too large to allocate with the alignment
+     */
+    public static MutableMemoryBuffer expandableDirect(final int initialCapacity, final int alignment) {
+        return MemoryBufferImpl.expandableDirect(initialCapacity, alignment);
+    }
+}

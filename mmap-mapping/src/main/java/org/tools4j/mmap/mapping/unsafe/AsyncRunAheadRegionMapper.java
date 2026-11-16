@@ -23,27 +23,27 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.agrona.concurrent.AtomicBuffer;
-import org.agrona.concurrent.UnsafeBuffer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.buffer.MemoryBuffers;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
+import org.tools4j.mmap.core.unsafe.Unsafe;
 import org.tools4j.mmap.mapping.api.AccessMode;
-import org.tools4j.mmap.mapping.api.AsyncRuntime;
 import org.tools4j.mmap.mapping.api.AsyncRuntime.Recurring;
+import org.tools4j.mmap.mapping.api.AsyncRuntime;
 import org.tools4j.mmap.mapping.api.RegionMetrics;
-import org.tools4j.mmap.mapping.api.Unsafe;
+import org.tools4j.mmap.mapping.config.MappingConfigurations;
 
 import java.util.function.Function;
 
 import static java.util.Objects.requireNonNull;
-import static org.agrona.BitUtil.CACHE_LINE_LENGTH;
-import static org.agrona.BitUtil.findNextPositivePowerOfTwo;
-import static org.agrona.BufferUtil.allocateDirectAligned;
+import static org.tools4j.mmap.core.internal.PowersOfTwo.ceilingPowerOfTwo;
+import static org.tools4j.mmap.core.internal.Validations.validateGreaterThanZero;
+import static org.tools4j.mmap.core.internal.Validations.validatePowerOfTwo;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_POSITION;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateAheadMappingCacheSize;
-import static org.tools4j.mmap.mapping.impl.Constraints.validateGreaterThanZero;
-import static org.tools4j.mmap.mapping.impl.Constraints.validatePowerOfTwo;
+import static org.tools4j.mmap.mapping.impl.Constants.CACHE_LINE_LENGTH;
+import static org.tools4j.mmap.mapping.impl.MappingValidations.validateAheadMappingCacheSize;
 
 /**
  * A region mapper that attempts to run ahead and pre-map regions that are likely going to be requested next.  Regions
@@ -53,14 +53,14 @@ import static org.tools4j.mmap.mapping.impl.Constraints.validatePowerOfTwo;
  * {@link SyncRegionMapper} or a {@link SyncRegionMapperAsyncUnmapper}).  A cache is used to store mapped positions
  */
 @Unsafe
-final class AsyncRunAheadRegionMapper implements RegionMapper {
+final class AsyncRunAheadRegionMapper implements RegionMapper, Describable {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(AsyncRunAheadRegionMapper.class);
     private static final long ADDRESS_UNAVAILABLE = NULL_ADDRESS - 1;
 
     private final AsyncRuntime asyncRuntime;
     private final RegionMapper baseMapper;
     private final RegionMapper cachingMapper;
+    private final LifecycleListener lifecycleListener;
     private final SharedState sharedState;
     private final AsyncMapper asyncMapper;
     private final int mapAhead;
@@ -88,6 +88,16 @@ final class AsyncRunAheadRegionMapper implements RegionMapper {
                                      final Function<? super RegionMapper, ? extends RegionMapper> cacheFactory,
                                      final int mapAhead,
                                      final int mapAheadCacheSize) {
+        this(asyncRuntime, baseMapper, cacheFactory, mapAhead, mapAheadCacheSize,
+                MappingConfigurations.defaultLifecycleListener());
+    }
+
+    public AsyncRunAheadRegionMapper(final AsyncRuntime asyncRuntime,
+                                     final DirectRegionMapper baseMapper,
+                                     final Function<? super RegionMapper, ? extends RegionMapper> cacheFactory,
+                                     final int mapAhead,
+                                     final int mapAheadCacheSize,
+                                     final LifecycleListener lifecycleListener) {
         requireNonNull(asyncRuntime);
         requireNonNull(baseMapper);
         requireNonNull(cacheFactory);
@@ -95,17 +105,19 @@ final class AsyncRunAheadRegionMapper implements RegionMapper {
         final int cacheSize = mapAheadCacheSize(mapAhead, mapAheadCacheSize);
         this.asyncRuntime = requireNonNull(asyncRuntime);
         this.baseMapper = requireNonNull(baseMapper);
+        this.lifecycleListener = requireNonNull(lifecycleListener);
         this.maxAheadPosition = baseMapper.fileMapper().mappingLimit() - baseMapper.regionSize();
         this.cachingMapper = cacheFactory.apply(new AheadMapper());
         this.sharedState = new SharedState(cacheSize, baseMapper.regionSize());
         this.asyncMapper = startAsyncMapper(baseMapper);
         this.mapAhead = mapAhead;
         this.lastPositionMapped = NULL_POSITION;
+        lifecycleListener.onOpened(this);
     }
 
     private static int mapAheadCacheSize(final int mapAhead, final int mapAheadCacheSize) {
         if (mapAheadCacheSize <= 0) {
-            return findNextPositivePowerOfTwo(mapAhead);
+            return ceilingPowerOfTwo(mapAhead);
         }
         validateAheadMappingCacheSize(mapAheadCacheSize);
         if (mapAhead > mapAheadCacheSize) {
@@ -187,20 +199,24 @@ final class AsyncRunAheadRegionMapper implements RegionMapper {
         if (!isClosed()) {
             cachingMapper.close();
             baseMapper.close();
-            LOGGER.info("Closed {}.", this);
+            lifecycleListener.onClosed(this);
         }
     }
 
     @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("AsyncRunAheadRegionMapper")
+                .append(":mapAhead=").append(mapAhead)
+                .append("|cachingMapper=").append(cachingMapper)
+                .append("|statistics=(async=").append(asyncStats)
+                .append("|sync=").append(syncStats)
+                .append("|busy=").append(busyStats)
+                .append(')');
+    }
+
+    @Override
     public String toString() {
-        return "AsyncRunAheadRegionMapper" +
-                ":mapAhead=" + mapAhead +
-                "|cachingMapper=" + cachingMapper +
-                "|statistics=" +
-                "(async=" + asyncStats +
-                "|sync=" + syncStats +
-                "|busy=" + busyStats +
-                ")";
+        return Describable.describe(this);
     }
 
     private final class AheadMapper implements RegionMapper {
@@ -300,7 +316,7 @@ final class AsyncRunAheadRegionMapper implements RegionMapper {
         static final int MAP_ADDRESS_OFFSET = 3;
         static final int VALUES_PER_RECORD = 4;
         static final int SHIFT_PER_RECORD = 2;
-        final AtomicBuffer ownershipPadded;
+        final MutableMemoryBuffer ownershipPadded;
         final long[] recordValues;
         final int indexMask;
         final int regionSizeShift;
@@ -309,7 +325,7 @@ final class AsyncRunAheadRegionMapper implements RegionMapper {
         SharedState(final int aheadCache, final int regionSize) {
             validatePowerOfTwo("Ahead cache size", aheadCache);
             validatePowerOfTwo("Region size", regionSize);
-            ownershipPadded = new UnsafeBuffer(allocateDirectAligned(aheadCache * OWNERSHIP_ENTRY_LENGTH, CACHE_LINE_LENGTH));
+            ownershipPadded = MemoryBuffers.allocateDirect(aheadCache * OWNERSHIP_ENTRY_LENGTH, CACHE_LINE_LENGTH);
             recordValues = new long[aheadCache * VALUES_PER_RECORD];
             indexMask = aheadCache - 1;
             regionSizeShift = Integer.SIZE - Integer.numberOfLeadingZeros(regionSize - 1);
@@ -326,11 +342,11 @@ final class AsyncRunAheadRegionMapper implements RegionMapper {
         }
 
         void assignToMapper(final int index) {
-            ownershipPadded.putIntOrdered(ownershipValueOffset(index), OWNED_BY_MAPPER);
+            ownershipPadded.putIntRelease(ownershipValueOffset(index), OWNED_BY_MAPPER);
         }
 
         void assignToRequester(final int index) {
-            ownershipPadded.putIntOrdered(ownershipValueOffset(index), OWNED_BY_REQUESTER);
+            ownershipPadded.putIntRelease(ownershipValueOffset(index), OWNED_BY_REQUESTER);
         }
 
         boolean isOwnedByMapper(final int index) {
@@ -434,7 +450,8 @@ final class AsyncRunAheadRegionMapper implements RegionMapper {
                 if (req != NULL_POSITION) {
                     long mappedAddr;
                     try {
-                        mappedAddr = fileMapper.map(req, regionSize);
+                        //NOTE: pre-touch, mapped ahead on the mapping thread before the requester uses it
+                        mappedAddr = fileMapper.map(req, regionSize, true);
                     } catch (final RuntimeException e) {
                         //NOTE: mapping ahead is speculative, the requester maps synchronously when needed and gets
                         //      the error then; the slot must be handed back to the requester in any case

@@ -23,13 +23,17 @@
  */
 package org.tools4j.mmap.mapping.unsafe;
 
-import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.tools4j.mmap.core.buffer.MutableMemoryBuffer;
 import org.tools4j.mmap.mapping.api.AccessMode;
 import org.tools4j.mmap.mapping.api.FileInitialiser;
+import org.tools4j.mmap.mapping.api.PreAccessHook;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -41,6 +45,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.tools4j.mmap.mapping.api.NullValues.NULL_ADDRESS;
@@ -54,7 +59,7 @@ class ExpandableSizeFileMapperTest {
 
     private static final int REGION_SIZE = (int) REGION_SIZE_GRANULARITY;
     private static final long MAX_FILE_SIZE = 8L * REGION_SIZE;
-    private static final FileInitialiser INITIALISER = FileInitialiser.none();
+    private static final FileInitialiser FILE_INITIALISER = FileInitialiser.LAZY;
 
     @TempDir
     Path tempDir;
@@ -63,13 +68,13 @@ class ExpandableSizeFileMapperTest {
 
     private ExpandableSizeFileMapper mapper(final long minFileSize) {
         file = tempDir.resolve("expandable.map").toFile();
-        return new ExpandableSizeFileMapper(file, minFileSize, MAX_FILE_SIZE, REGION_SIZE, INITIALISER);
+        return new ExpandableSizeFileMapper(file, minFileSize, MAX_FILE_SIZE, REGION_SIZE, FILE_INITIALISER);
     }
 
     private static long mapAndWrite(final FileMapper mapper, final long position, final long value) {
-        final long address = mapper.map(position, REGION_SIZE);
+        final long address = mapper.map(position, REGION_SIZE, false);
         assertNotEquals(NULL_ADDRESS, address, "position " + position);
-        new UnsafeBuffer(address, REGION_SIZE).putLong(0, value);
+        TestBuffers.wrap(address, REGION_SIZE).putLong(0, value);
         mapper.unmap(position, address, REGION_SIZE);
         return address;
     }
@@ -105,19 +110,53 @@ class ExpandableSizeFileMapperTest {
             mapAndWrite(mapper, 5L * REGION_SIZE, 0x0102030405060708L);
         }
         try (final ExpandableSizeFileMapper mapper = mapper(0)) {
-            final long address = mapper.map(5L * REGION_SIZE, REGION_SIZE);
-            assertEquals(0x0102030405060708L, new UnsafeBuffer(address, REGION_SIZE).getLong(0));
+            final long address = mapper.map(5L * REGION_SIZE, REGION_SIZE, false);
+            assertEquals(0x0102030405060708L, TestBuffers.wrap(address, REGION_SIZE).getLong(0));
             mapper.unmap(5L * REGION_SIZE, address, REGION_SIZE);
             assertEquals(6L * REGION_SIZE, file.length());
         }
     }
 
     @Test
+    void fileCreationErrorIsThrownOnEveryMap() throws IOException {
+        final File notADirectory = tempDir.resolve("not-a-directory").toFile();
+        assertTrue(notADirectory.createNewFile());
+        file = new File(notADirectory, "expandable.map");
+        try (final ExpandableSizeFileMapper mapper = new ExpandableSizeFileMapper(file, 0, MAX_FILE_SIZE, REGION_SIZE,
+                FILE_INITIALISER)) {
+            for (int i = 0; i < 2; i++) {
+                final UncheckedIOException error = assertThrows(UncheckedIOException.class,
+                        () -> mapper.map(0, REGION_SIZE, false));
+                assertTrue(error.getMessage().contains(file.getPath()), error.getMessage());
+            }
+        }
+    }
+
+    @Test
+    void fileInitialiserErrorIsThrownOnEveryMap() {
+        final IOException cause = new IOException("test initialiser error");
+        final PreAccessHook failingInitialiser = new PreAccessHook() {
+            @Override
+            public void onOpen(final File file, final FileChannel channel, final long size) throws IOException {
+                throw cause;
+            }
+        };
+        file = tempDir.resolve("expandable.map").toFile();
+        try (final ExpandableSizeFileMapper mapper = new ExpandableSizeFileMapper(file, 0, MAX_FILE_SIZE, REGION_SIZE,
+                accessMode -> failingInitialiser)) {
+            for (int i = 0; i < 2; i++) {
+                assertSame(cause, assertThrows(UncheckedIOException.class, () -> mapper.map(0, REGION_SIZE, false))
+                        .getCause());
+            }
+        }
+    }
+
+    @Test
     void mappingBeyondMaxFileSizeIsRejected() {
         try (final ExpandableSizeFileMapper mapper = mapper(0)) {
-            assertThrows(IllegalArgumentException.class, () -> mapper.map(MAX_FILE_SIZE, REGION_SIZE));
+            assertThrows(IllegalArgumentException.class, () -> mapper.map(MAX_FILE_SIZE, REGION_SIZE, false));
             assertThrows(IllegalArgumentException.class, () -> mapper.map(MAX_FILE_SIZE - REGION_SIZE + 1,
-                    REGION_SIZE));
+                    REGION_SIZE, false));
         }
     }
 
@@ -125,25 +164,25 @@ class ExpandableSizeFileMapperTest {
     void invalidSizesAreRejected() {
         final File file = tempDir.resolve("invalid.map").toFile();
         assertThrows(IllegalArgumentException.class, () -> new ExpandableSizeFileMapper(file, 0,
-                REGION_SIZE / 2, REGION_SIZE, INITIALISER), "max smaller than region");
+                REGION_SIZE / 2, REGION_SIZE, FILE_INITIALISER), "max smaller than region");
         assertThrows(IllegalArgumentException.class, () -> new ExpandableSizeFileMapper(file, 4L * REGION_SIZE,
-                2L * REGION_SIZE, REGION_SIZE, INITIALISER), "max smaller than min");
+                2L * REGION_SIZE, REGION_SIZE, FILE_INITIALISER), "max smaller than min");
         assertThrows(IllegalArgumentException.class, () -> new ExpandableSizeFileMapper(file, REGION_SIZE,
-                MAX_FILE_SIZE, 2 * REGION_SIZE, INITIALISER), "min smaller than region");
+                MAX_FILE_SIZE, 2 * REGION_SIZE, FILE_INITIALISER), "min smaller than region");
         assertThrows(IllegalArgumentException.class, () -> new ExpandableSizeFileMapper(file, 3L * REGION_SIZE,
-                MAX_FILE_SIZE, REGION_SIZE, INITIALISER), "min not a power of two");
+                MAX_FILE_SIZE, REGION_SIZE, FILE_INITIALISER), "min not a power of two");
     }
 
     @Test
     void closedMapperDoesNotMapAndRejectsUnmap() {
         final ExpandableSizeFileMapper mapper = mapper(0);
-        final long address = mapper.map(0, REGION_SIZE);
+        final long address = mapper.map(0, REGION_SIZE, false);
         assertFalse(mapper.isClosed());
         mapper.close();
         assertTrue(mapper.isClosed());
         assertTrue(mapper.toString().contains("|closed=true"), mapper.toString());
         mapper.close();
-        assertThrows(IllegalStateException.class, () -> mapper.map(0, REGION_SIZE));
+        assertThrows(IllegalStateException.class, () -> mapper.map(0, REGION_SIZE, false));
         assertThrows(IllegalStateException.class, () -> mapper.unmap(0, address, REGION_SIZE));
         FileChannels.unmap(address, REGION_SIZE);
     }
@@ -163,9 +202,9 @@ class ExpandableSizeFileMapperTest {
                         //each thread grows the file region by region, starting at a different region
                         for (int i = 0; i < regions; i++) {
                             final int region = (thread + i) % regions;
-                            final long address = mapper.map((long) region * REGION_SIZE, REGION_SIZE);
+                            final long address = mapper.map((long) region * REGION_SIZE, REGION_SIZE, false);
                             assertNotEquals(NULL_ADDRESS, address, "region " + region);
-                            new UnsafeBuffer(address, REGION_SIZE).putLong(thread * Long.BYTES, region + 1);
+                            TestBuffers.wrap(address, REGION_SIZE).putLong(thread * Long.BYTES, region + 1);
                             mapper.unmap((long) region * REGION_SIZE, address, REGION_SIZE);
                         }
                     } catch (final Throwable e) {
@@ -182,8 +221,8 @@ class ExpandableSizeFileMapperTest {
             assertNull(error.get(), () -> "mapping failed: " + error.get());
             assertEquals(MAX_FILE_SIZE, file.length());
             for (int region = 0; region < regions; region++) {
-                final long address = mapper.map((long) region * REGION_SIZE, REGION_SIZE);
-                final UnsafeBuffer buffer = new UnsafeBuffer(address, REGION_SIZE);
+                final long address = mapper.map((long) region * REGION_SIZE, REGION_SIZE, false);
+                final MutableMemoryBuffer buffer = TestBuffers.wrap(address, REGION_SIZE);
                 for (int thread = 0; thread < threads; thread++) {
                     assertEquals(region + 1, buffer.getLong(thread * Long.BYTES), "region " + region);
                 }
@@ -202,8 +241,8 @@ class ExpandableSizeFileMapperTest {
             //no extension needed, the second mapper picks up the length from the file
             mapAndWrite(second, 2L * REGION_SIZE, 3);
             assertEquals(4L * REGION_SIZE, file.length());
-            final long address = second.map(3L * REGION_SIZE, REGION_SIZE);
-            assertEquals(2, new UnsafeBuffer(address, REGION_SIZE).getLong(0));
+            final long address = second.map(3L * REGION_SIZE, REGION_SIZE, false);
+            assertEquals(2, TestBuffers.wrap(address, REGION_SIZE).getLong(0));
             second.unmap(3L * REGION_SIZE, address, REGION_SIZE);
         }
     }

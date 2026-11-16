@@ -23,9 +23,12 @@
  */
 package org.tools4j.mmap.mapping.config;
 
+import org.tools4j.mmap.core.base.ErrorListener;
+import org.tools4j.mmap.core.base.LifecycleListener;
+import org.tools4j.mmap.core.config.CoreConfigurations;
 import org.tools4j.mmap.mapping.api.DynamicMapping;
+import org.tools4j.mmap.mapping.api.FileInitialiser;
 import org.tools4j.mmap.mapping.api.Mappings;
-import org.tools4j.mmap.mapping.api.RegionMapping;
 import org.tools4j.mmap.mapping.impl.MappingConfiguratorImpl;
 
 import java.util.function.Consumer;
@@ -101,9 +104,9 @@ public interface MappingConfigurator extends MappingConfig {
     /**
      * Sets the maximum number of open files, applicable only if {@linkplain #rollFiles() file rolling} is used.
      *
-     * @param maxOpenFiles the maximum files to keep open in file rolling mode
+     * @param maxOpenFiles the maximum files to keep open in file rolling mode, or zero to reset it to the default
      * @return this configurator for method chaining
-     * @throws IllegalArgumentException if max open files is less than one
+     * @throws IllegalArgumentException if max open files is negative
      * @see #rollFiles(boolean)
      */
     MappingConfigurator maxOpenFiles(int maxOpenFiles);
@@ -118,6 +121,16 @@ public interface MappingConfigurator extends MappingConfig {
      * @see #rollFiles(boolean)
      */
     MappingConfigurator filesToCreateAhead(int filesToCreateAhead);
+
+    /**
+     * Sets the file initialiser, providing the hook invoked before a file or its new space is accessed through a
+     * mapping.
+     *
+     * @param fileInitialiser the file initialiser, for instance {@link FileInitialiser#ZERO}
+     * @return this configurator for method chaining
+     * @see MappingConfigurations#defaultFileInitialiser()
+     */
+    MappingConfigurator fileInitialiser(FileInitialiser fileInitialiser);
 
     /**
      * Sets the mapping strategy configuration to use. Alternatively, {@link #mappingStrategy(Consumer)} can be used
@@ -140,6 +153,24 @@ public interface MappingConfigurator extends MappingConfig {
      * @return this configurator for method chaining
      */
     MappingConfigurator mappingStrategy(Consumer<? super MappingStrategyConfigurator> configurator);
+
+    /**
+     * Sets the listener for lifecycle events such as files created, opened and closed.
+     *
+     * @param lifecycleListener the lifecycle listener, for instance {@link LifecycleListener#NO_OP}
+     * @return this configurator for method chaining
+     * @see MappingConfigurations#defaultLifecycleListener()
+     */
+    MappingConfigurator lifecycleListener(LifecycleListener lifecycleListener);
+
+    /**
+     * Sets the listener for errors that cannot be thrown to the caller, and for warnings.
+     *
+     * @param errorListener the error listener, for instance {@link ErrorListener#NO_OP}
+     * @return this configurator for method chaining
+     * @see CoreConfigurations#defaultErrorListener()
+     */
+    MappingConfigurator errorListener(ErrorListener errorListener);
 
     /**
      * Resets all values set on this configurator, so that values are again taken from the defaults this configurator

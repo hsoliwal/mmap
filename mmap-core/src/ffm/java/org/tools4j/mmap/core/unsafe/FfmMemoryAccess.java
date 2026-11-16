@@ -1,0 +1,653 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2016-2026 tools4j.org (Marco Terzer, Anton Anufriev)
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package org.tools4j.mmap.core.unsafe;
+
+import org.tools4j.mmap.core.base.Describable;
+import org.tools4j.mmap.core.config.CoreConfigurations;
+
+import java.lang.foreign.MemorySegment;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
+import static java.lang.foreign.ValueLayout.JAVA_CHAR;
+import static java.lang.foreign.ValueLayout.JAVA_CHAR_UNALIGNED;
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+import static java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED;
+import static java.lang.foreign.ValueLayout.JAVA_LONG;
+import static java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED;
+import static java.lang.foreign.ValueLayout.JAVA_SHORT;
+import static java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED;
+
+/**
+ * Memory access through the Foreign Function and Memory API, Java 22 or later, compiled only when building with Java
+ * 22 or later and loaded by name.
+ * <p>
+ * Direct memory is accessed through one segment spanning all addresses, so that wrapping an address creates no
+ * segment; creating that segment is a restricted operation, warning unless {@code --enable-native-access} allows it.
+ * A {@code byte[]} is its own heap base, accessed through byte array views, which only support plain access. A
+ * {@code long[]} is represented by its heap segment, created once per array, which also supports ordered and atomic
+ * access.
+ * <p>
+ * Byte buffers are accessed through their fields, the address of a direct one and the array of a heap one, if
+ * {@code java.nio} is open to this class ({@code --add-opens java.base/java.nio=ALL-UNNAMED}); otherwise through a
+ * segment created per call, allocating unless the JIT compiler eliminates it, which it doesn't reliably do, warning
+ * once through the default error listener when this class is initialised, i.e. when the first buffer is created, so
+ * that a missing flag shows at startup. A heap byte buffer over a segment of an array other than
+ * a {@code byte[]} has no array and is always represented by its segment.
+ */
+@Unsafe
+public enum FfmMemoryAccess implements MemoryAccess, Describable {
+    /** The only instance. */
+    INSTANCE;
+
+    private static final MemorySegment ALL = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
+
+    /** The fields of byte buffers, or null if {@code java.nio} is not open to this class. */
+    private static final VarHandle BUFFER_ADDRESS = nioField(Buffer.class, "address", long.class);
+    private static final VarHandle BYTE_BUFFER_ARRAY = nioField(ByteBuffer.class, "hb", byte[].class);
+    private static final VarHandle BYTE_BUFFER_ARRAY_OFFSET = nioField(ByteBuffer.class, "offset", int.class);
+
+    private static final long BYTE_PATTERN = 0x0101010101010101L;
+
+    private static final VarHandle BYTE = JAVA_BYTE.varHandle();
+    private static final VarHandle SHORT = JAVA_SHORT.varHandle();
+    private static final VarHandle SHORT_UNALIGNED = JAVA_SHORT_UNALIGNED.varHandle();
+    private static final VarHandle CHAR = JAVA_CHAR.varHandle();
+    private static final VarHandle CHAR_UNALIGNED = JAVA_CHAR_UNALIGNED.varHandle();
+    private static final VarHandle INT = JAVA_INT.varHandle();
+    private static final VarHandle INT_UNALIGNED = JAVA_INT_UNALIGNED.varHandle();
+    private static final VarHandle LONG = JAVA_LONG.varHandle();
+    private static final VarHandle LONG_UNALIGNED = JAVA_LONG_UNALIGNED.varHandle();
+
+    private static final VarHandle BYTES = MethodHandles.arrayElementVarHandle(byte[].class);
+    private static final VarHandle BYTES_AS_SHORT = MethodHandles.byteArrayViewVarHandle(short[].class,
+            ByteOrder.nativeOrder());
+    private static final VarHandle BYTES_AS_CHAR = MethodHandles.byteArrayViewVarHandle(char[].class,
+            ByteOrder.nativeOrder());
+    private static final VarHandle BYTES_AS_INT = MethodHandles.byteArrayViewVarHandle(int[].class,
+            ByteOrder.nativeOrder());
+    private static final VarHandle BYTES_AS_LONG = MethodHandles.byteArrayViewVarHandle(long[].class,
+            ByteOrder.nativeOrder());
+
+    static {
+        if (BUFFER_ADDRESS == null || BYTE_BUFFER_ARRAY == null || BYTE_BUFFER_ARRAY_OFFSET == null) {
+            CoreConfigurations.defaultErrorListener().onWarning(INSTANCE, "Byte buffers will be accessed through " +
+                    "a segment allocated per wrap or copy, if used, since java.nio is not open to mmap-core: add " +
+                    "--add-opens java.base/java.nio=ALL-UNNAMED to access them without allocating");
+        }
+    }
+
+    /**
+     * Segment of direct memory for a null base, else of long[] memory or of a heap byte buffer without array: a
+     * byte[] base goes to the byte[] overloads, or to copy and set memory, which check for it.
+     */
+    private static MemorySegment segment(final Object base) {
+        return base == null ? ALL : (MemorySegment) base;
+    }
+
+    private static VarHandle nioField(final Class<?> owner, final String name, final Class<?> type) {
+        try {
+            return MethodHandles.privateLookupIn(owner, MethodHandles.lookup()).findVarHandle(owner, name, type);
+        } catch (final ReflectiveOperationException e) {
+            return null;//not open, or no such field in this JDK: falls back to segments
+        }
+    }
+
+    @Override
+    public StringBuilder describeTo(final StringBuilder sb) {
+        return sb.append("FfmMemoryAccess");
+    }
+
+    @Override
+    public Object heapBase(final byte[] array) {
+        return array;
+    }
+
+    /**
+     * Returns the heap segment of the array, allocating it: only called when a {@code FIXED} or {@code EXPANDABLE}
+     * buffer is created, or an {@code EXPANDABLE} one expands, all allocating anyway; flyweights wrapping such a
+     * buffer share its segment.
+     */
+    @Override
+    public Object heapBase(final long[] array) {
+        return MemorySegment.ofArray(array);
+    }
+
+    @Override
+    public long heapOffset(final byte[] array, final int byteOffset) {
+        return byteOffset;
+    }
+
+    @Override
+    public long heapOffset(final long[] array, final int byteOffset) {
+        return byteOffset;
+    }
+
+    /**
+     * Returns the array of a heap byte buffer, else a segment of the whole byte buffer, read-only for a read-only one,
+     * allocating the segment and a duplicate of the byte buffer: only if the byte buffer hides its array, i.e. is
+     * read-only, and {@code java.nio} is not open, or if it is a segment of an array other than a {@code byte[]}; only
+     * called by a flyweight wrapping a byte buffer it doesn't wrap already.
+     */
+    @Override
+    public Object heapBase(final ByteBuffer buffer) {
+        final byte[] array = array(buffer);
+        return array != null ? array : MemorySegment.ofBuffer(buffer.duplicate().clear());
+    }
+
+    @Override
+    public long heapOffset(final ByteBuffer buffer, final int byteOffset) {
+        return array(buffer) != null ? arrayOffset(buffer) + byteOffset : byteOffset;
+    }
+
+    /** Returns the array of a heap byte buffer, or null if it has none or hides it. */
+    private static byte[] array(final ByteBuffer buffer) {
+        if (BYTE_BUFFER_ARRAY != null) {
+            return (byte[]) BYTE_BUFFER_ARRAY.get(buffer);
+        }
+        if (buffer.hasArray()) {
+            return buffer.array();
+        }
+        return null;
+    }
+
+    private static int arrayOffset(final ByteBuffer buffer) {
+        return BYTE_BUFFER_ARRAY_OFFSET != null ? (int) BYTE_BUFFER_ARRAY_OFFSET.get(buffer) : buffer.arrayOffset();
+    }
+
+    /**
+     * Returns the address of a direct byte buffer from its field, else from its segment, allocating it unless the
+     * JIT compiler eliminates it, if {@code java.nio} is not open.
+     */
+    @Override
+    public long address(final ByteBuffer buffer) {
+        if (BUFFER_ADDRESS != null) {
+            return (long) BUFFER_ADDRESS.get((Buffer) buffer);
+        }
+        //the segment of a buffer starts at its position
+        return MemorySegment.ofBuffer(buffer).address() - buffer.position();
+    }
+
+    @Override
+    public byte getByte(final long address) {
+        return (byte) BYTE.get(ALL, address);
+    }
+
+    @Override
+    public byte getByte(final Object base, final long offset) {
+        return (byte) BYTE.get(segment(base), offset);
+    }
+
+    @Override
+    public byte getByte(final byte[] base, final long offset) {
+        return base[(int) offset];
+    }
+
+    @Override
+    public void putByte(final long address, final byte value) {
+        BYTE.set(ALL, address, value);
+    }
+
+    @Override
+    public void putByte(final Object base, final long offset, final byte value) {
+        BYTE.set(segment(base), offset, value);
+    }
+
+    @Override
+    public void putByte(final byte[] base, final long offset, final byte value) {
+        base[(int) offset] = value;
+    }
+
+    @Override
+    public short getShort(final long address) {
+        return (short) SHORT_UNALIGNED.get(ALL, address);
+    }
+
+    @Override
+    public short getShort(final Object base, final long offset) {
+        return (short) SHORT_UNALIGNED.get(segment(base), offset);
+    }
+
+    @Override
+    public short getShort(final byte[] base, final long offset) {
+        return (short) BYTES_AS_SHORT.get(base, (int) offset);
+    }
+
+    @Override
+    public void putShort(final long address, final short value) {
+        SHORT_UNALIGNED.set(ALL, address, value);
+    }
+
+    @Override
+    public void putShort(final Object base, final long offset, final short value) {
+        SHORT_UNALIGNED.set(segment(base), offset, value);
+    }
+
+    @Override
+    public void putShort(final byte[] base, final long offset, final short value) {
+        BYTES_AS_SHORT.set(base, (int) offset, value);
+    }
+
+    @Override
+    public char getChar(final long address) {
+        return (char) CHAR_UNALIGNED.get(ALL, address);
+    }
+
+    @Override
+    public char getChar(final Object base, final long offset) {
+        return (char) CHAR_UNALIGNED.get(segment(base), offset);
+    }
+
+    @Override
+    public char getChar(final byte[] base, final long offset) {
+        return (char) BYTES_AS_CHAR.get(base, (int) offset);
+    }
+
+    @Override
+    public void putChar(final long address, final char value) {
+        CHAR_UNALIGNED.set(ALL, address, value);
+    }
+
+    @Override
+    public void putChar(final Object base, final long offset, final char value) {
+        CHAR_UNALIGNED.set(segment(base), offset, value);
+    }
+
+    @Override
+    public void putChar(final byte[] base, final long offset, final char value) {
+        BYTES_AS_CHAR.set(base, (int) offset, value);
+    }
+
+    @Override
+    public int getInt(final long address) {
+        return (int) INT_UNALIGNED.get(ALL, address);
+    }
+
+    @Override
+    public int getInt(final Object base, final long offset) {
+        return (int) INT_UNALIGNED.get(segment(base), offset);
+    }
+
+    @Override
+    public int getInt(final byte[] base, final long offset) {
+        return (int) BYTES_AS_INT.get(base, (int) offset);
+    }
+
+    @Override
+    public void putInt(final long address, final int value) {
+        INT_UNALIGNED.set(ALL, address, value);
+    }
+
+    @Override
+    public void putInt(final Object base, final long offset, final int value) {
+        INT_UNALIGNED.set(segment(base), offset, value);
+    }
+
+    @Override
+    public void putInt(final byte[] base, final long offset, final int value) {
+        BYTES_AS_INT.set(base, (int) offset, value);
+    }
+
+    @Override
+    public long getLong(final long address) {
+        return (long) LONG_UNALIGNED.get(ALL, address);
+    }
+
+    @Override
+    public long getLong(final Object base, final long offset) {
+        return (long) LONG_UNALIGNED.get(segment(base), offset);
+    }
+
+    @Override
+    public long getLong(final byte[] base, final long offset) {
+        return (long) BYTES_AS_LONG.get(base, (int) offset);
+    }
+
+    @Override
+    public void putLong(final long address, final long value) {
+        LONG_UNALIGNED.set(ALL, address, value);
+    }
+
+    @Override
+    public void putLong(final Object base, final long offset, final long value) {
+        LONG_UNALIGNED.set(segment(base), offset, value);
+    }
+
+    @Override
+    public void putLong(final byte[] base, final long offset, final long value) {
+        BYTES_AS_LONG.set(base, (int) offset, value);
+    }
+
+    @Override
+    public byte getByteVolatile(final long address) {
+        return (byte) BYTE.getVolatile(ALL, address);
+    }
+
+    @Override
+    public byte getByteVolatile(final Object base, final long offset) {
+        return (byte) BYTE.getVolatile(segment(base), offset);
+    }
+
+    @Override
+    public byte getByteVolatile(final byte[] base, final long offset) {
+        return (byte) BYTES.getVolatile(base, (int) offset);
+    }
+
+    @Override
+    public void putByteVolatile(final long address, final byte value) {
+        BYTE.setVolatile(ALL, address, value);
+    }
+
+    @Override
+    public void putByteVolatile(final Object base, final long offset, final byte value) {
+        BYTE.setVolatile(segment(base), offset, value);
+    }
+
+    @Override
+    public void putByteVolatile(final byte[] base, final long offset, final byte value) {
+        BYTES.setVolatile(base, (int) offset, value);
+    }
+
+    @Override
+    public short getShortVolatile(final long address) {
+        return (short) SHORT.getVolatile(ALL, address);
+    }
+
+    @Override
+    public short getShortVolatile(final Object base, final long offset) {
+        return (short) SHORT.getVolatile(segment(base), offset);
+    }
+
+    @Override
+    public void putShortVolatile(final long address, final short value) {
+        SHORT.setVolatile(ALL, address, value);
+    }
+
+    @Override
+    public void putShortVolatile(final Object base, final long offset, final short value) {
+        SHORT.setVolatile(segment(base), offset, value);
+    }
+
+    @Override
+    public char getCharVolatile(final long address) {
+        return (char) CHAR.getVolatile(ALL, address);
+    }
+
+    @Override
+    public char getCharVolatile(final Object base, final long offset) {
+        return (char) CHAR.getVolatile(segment(base), offset);
+    }
+
+    @Override
+    public void putCharVolatile(final long address, final char value) {
+        CHAR.setVolatile(ALL, address, value);
+    }
+
+    @Override
+    public void putCharVolatile(final Object base, final long offset, final char value) {
+        CHAR.setVolatile(segment(base), offset, value);
+    }
+
+    @Override
+    public int getIntOpaque(final long address) {
+        return (int) INT.getOpaque(ALL, address);
+    }
+
+    @Override
+    public int getIntOpaque(final Object base, final long offset) {
+        return (int) INT.getOpaque(segment(base), offset);
+    }
+
+    @Override
+    public int getIntAcquire(final long address) {
+        return (int) INT.getAcquire(ALL, address);
+    }
+
+    @Override
+    public int getIntAcquire(final Object base, final long offset) {
+        return (int) INT.getAcquire(segment(base), offset);
+    }
+
+    @Override
+    public int getIntVolatile(final long address) {
+        return (int) INT.getVolatile(ALL, address);
+    }
+
+    @Override
+    public int getIntVolatile(final Object base, final long offset) {
+        return (int) INT.getVolatile(segment(base), offset);
+    }
+
+    @Override
+    public void putIntOpaque(final long address, final int value) {
+        INT.setOpaque(ALL, address, value);
+    }
+
+    @Override
+    public void putIntOpaque(final Object base, final long offset, final int value) {
+        INT.setOpaque(segment(base), offset, value);
+    }
+
+    @Override
+    public void putIntRelease(final long address, final int value) {
+        INT.setRelease(ALL, address, value);
+    }
+
+    @Override
+    public void putIntRelease(final Object base, final long offset, final int value) {
+        INT.setRelease(segment(base), offset, value);
+    }
+
+    @Override
+    public void putIntVolatile(final long address, final int value) {
+        INT.setVolatile(ALL, address, value);
+    }
+
+    @Override
+    public void putIntVolatile(final Object base, final long offset, final int value) {
+        INT.setVolatile(segment(base), offset, value);
+    }
+
+    @Override
+    public boolean compareAndSetInt(final long address, final int expected, final int update) {
+        return INT.compareAndSet(ALL, address, expected, update);
+    }
+
+    @Override
+    public boolean compareAndSetInt(final Object base, final long offset, final int expected, final int update) {
+        return INT.compareAndSet(segment(base), offset, expected, update);
+    }
+
+    @Override
+    public int compareAndExchangeInt(final long address, final int expected, final int update) {
+        return (int) INT.compareAndExchange(ALL, address, expected, update);
+    }
+
+    @Override
+    public int compareAndExchangeInt(final Object base, final long offset, final int expected, final int update) {
+        return (int) INT.compareAndExchange(segment(base), offset, expected, update);
+    }
+
+    @Override
+    public int getAndAddInt(final long address, final int delta) {
+        return (int) INT.getAndAdd(ALL, address, delta);
+    }
+
+    @Override
+    public int getAndAddInt(final Object base, final long offset, final int delta) {
+        return (int) INT.getAndAdd(segment(base), offset, delta);
+    }
+
+    @Override
+    public int getAndSetInt(final long address, final int value) {
+        return (int) INT.getAndSet(ALL, address, value);
+    }
+
+    @Override
+    public int getAndSetInt(final Object base, final long offset, final int value) {
+        return (int) INT.getAndSet(segment(base), offset, value);
+    }
+
+    @Override
+    public long getLongOpaque(final long address) {
+        return (long) LONG.getOpaque(ALL, address);
+    }
+
+    @Override
+    public long getLongOpaque(final Object base, final long offset) {
+        return (long) LONG.getOpaque(segment(base), offset);
+    }
+
+    @Override
+    public long getLongAcquire(final long address) {
+        return (long) LONG.getAcquire(ALL, address);
+    }
+
+    @Override
+    public long getLongAcquire(final Object base, final long offset) {
+        return (long) LONG.getAcquire(segment(base), offset);
+    }
+
+    @Override
+    public long getLongVolatile(final long address) {
+        return (long) LONG.getVolatile(ALL, address);
+    }
+
+    @Override
+    public long getLongVolatile(final Object base, final long offset) {
+        return (long) LONG.getVolatile(segment(base), offset);
+    }
+
+    @Override
+    public void putLongOpaque(final long address, final long value) {
+        LONG.setOpaque(ALL, address, value);
+    }
+
+    @Override
+    public void putLongOpaque(final Object base, final long offset, final long value) {
+        LONG.setOpaque(segment(base), offset, value);
+    }
+
+    @Override
+    public void putLongRelease(final long address, final long value) {
+        LONG.setRelease(ALL, address, value);
+    }
+
+    @Override
+    public void putLongRelease(final Object base, final long offset, final long value) {
+        LONG.setRelease(segment(base), offset, value);
+    }
+
+    @Override
+    public void putLongVolatile(final long address, final long value) {
+        LONG.setVolatile(ALL, address, value);
+    }
+
+    @Override
+    public void putLongVolatile(final Object base, final long offset, final long value) {
+        LONG.setVolatile(segment(base), offset, value);
+    }
+
+    @Override
+    public boolean compareAndSetLong(final long address, final long expected, final long update) {
+        return LONG.compareAndSet(ALL, address, expected, update);
+    }
+
+    @Override
+    public boolean compareAndSetLong(final Object base, final long offset, final long expected, final long update) {
+        return LONG.compareAndSet(segment(base), offset, expected, update);
+    }
+
+    @Override
+    public long compareAndExchangeLong(final long address, final long expected, final long update) {
+        return (long) LONG.compareAndExchange(ALL, address, expected, update);
+    }
+
+    @Override
+    public long compareAndExchangeLong(final Object base, final long offset, final long expected, final long update) {
+        return (long) LONG.compareAndExchange(segment(base), offset, expected, update);
+    }
+
+    @Override
+    public long getAndAddLong(final long address, final long delta) {
+        return (long) LONG.getAndAdd(ALL, address, delta);
+    }
+
+    @Override
+    public long getAndAddLong(final Object base, final long offset, final long delta) {
+        return (long) LONG.getAndAdd(segment(base), offset, delta);
+    }
+
+    @Override
+    public long getAndSetLong(final long address, final long value) {
+        return (long) LONG.getAndSet(ALL, address, value);
+    }
+
+    @Override
+    public long getAndSetLong(final Object base, final long offset, final long value) {
+        return (long) LONG.getAndSet(segment(base), offset, value);
+    }
+
+    @Override
+    public void copyMemory(final Object sourceBase, final long sourceOffset, final Object destinationBase,
+                           final long destinationOffset, final long length) {
+        if (sourceBase instanceof byte[] source) {
+            if (destinationBase instanceof byte[] destination) {
+                System.arraycopy(source, (int) sourceOffset, destination, (int) destinationOffset, (int) length);
+            } else {
+                MemorySegment.copy(source, (int) sourceOffset, segment(destinationBase), JAVA_BYTE,
+                        destinationOffset, (int) length);
+            }
+        } else if (destinationBase instanceof byte[] destination) {
+            MemorySegment.copy(segment(sourceBase), JAVA_BYTE, sourceOffset, destination, (int) destinationOffset,
+                    (int) length);
+        } else {
+            MemorySegment.copy(segment(sourceBase), sourceOffset, segment(destinationBase), destinationOffset,
+                    length);
+        }
+    }
+
+    @Override
+    public void setMemory(final Object base, final long offset, final long length, final byte value) {
+        if (base instanceof byte[] array) {
+            Arrays.fill(array, (int) offset, (int) (offset + length), value);
+            return;
+        }
+        //no slice and fill, as a slice is a new segment
+        final MemorySegment segment = segment(base);
+        final long pattern = (value & 0xffL) * BYTE_PATTERN;
+        long index = 0;
+        for (; index <= length - Long.BYTES; index += Long.BYTES) {
+            LONG_UNALIGNED.set(segment, offset + index, pattern);
+        }
+        for (; index < length; index++) {
+            BYTE.set(segment, offset + index, value);
+        }
+    }
+}
