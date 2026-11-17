@@ -31,12 +31,13 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
-import java.lang.reflect.Method;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
 
 /**
- * Code copied from older versions of Agrona's {@link org.agrona.IoUtil}.
+ * Maps and unmaps file regions by address, without allocating, through the JDK's internal file channel implementation
+ * on Java 17 and its file dispatcher on Java 21 or later, reached through the trusted lookup; originally derived from
+ * older versions of Agrona's {@code IoUtil}.
  */
 @Unsafe
 public enum FileChannels {
@@ -125,7 +126,7 @@ public enum FileChannels {
             try {
                 final Class<?> fileChannelClass = Class.forName("sun.nio.ch.FileChannelImpl");
                 final Class<?> fileDispatcherClass = Class.forName("sun.nio.ch.FileDispatcher");
-                MethodHandles.Lookup lookup = MethodHandles.lookup();
+                final MethodHandles.Lookup lookup = UnsafeAccess.trustedLookup();
                 Object fileDispatcher = null;
                 MethodHandle mapFileDispatcher = null;
                 MethodHandle getFD = null;
@@ -134,9 +135,9 @@ public enum FileChannels {
                 MethodHandle unmapAddress = null;
                 try {
                     // JDK 21+
-                    lookup = UnsafeAccess.trustedLookup();
                     fileDispatcher = lookup.unreflectGetter(fileChannelClass.getDeclaredField("nd")).invoke();
                     getFD = lookup.unreflectGetter(fileChannelClass.getDeclaredField("fd"));
+                    //noinspection JavaReflectionMemberAccess
                     mapFileDispatcher = lookup.unreflect(fileDispatcherClass.getDeclaredMethod(
                             "map",
                             FileDescriptor.class,
@@ -144,13 +145,15 @@ public enum FileChannels {
                             long.class,
                             long.class,
                             boolean.class));
+                    //noinspection JavaReflectionMemberAccess
                     unmapFileDispatcher = lookup.unreflect(
                             fileDispatcherClass.getDeclaredMethod("unmap", long.class, long.class));
                 } catch (final Throwable ex) {
-                    unmapAddress = lookup.unreflect(getMethod(fileChannelClass, "unmap0", long.class, long.class));
                     // JDK 17
-                    mapWithSyncAddress = lookup.unreflect(getMethod(
-                            fileChannelClass, "map0", int.class, long.class, long.class, boolean.class));
+                    unmapAddress = lookup.unreflect(fileChannelClass.getDeclaredMethod(
+                            "unmap0", long.class, long.class));
+                    mapWithSyncAddress = lookup.unreflect(fileChannelClass.getDeclaredMethod(
+                            "map0", int.class, long.class, long.class, boolean.class));
                 }
                 MAP_FILE_DISPATCHER = mapFileDispatcher;
                 UNMAP_FILE_DISPATCHER = unmapFileDispatcher;
@@ -161,13 +164,6 @@ public enum FileChannels {
             } catch (final Exception ex) {
                 throw new RuntimeException(ex);
             }
-        }
-
-        private static Method getMethod(final Class<?> klass, final String name, final Class<?>... parameterTypes)
-                throws NoSuchMethodException {
-            final Method method = klass.getDeclaredMethod(name, parameterTypes);
-            method.setAccessible(true);
-            return method;
         }
     }
 }

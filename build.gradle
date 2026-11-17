@@ -144,13 +144,6 @@ subprojects {
 
     tasks.withType(JavaCompile) {
         options.compilerArgs.add('-Xlint:-options')
-        if (JavaVersion.current().isJava9Compatible()) {
-            options.compilerArgs.addAll(['--add-exports', 'java.base/java.lang.reflect=ALL-UNNAMED'])
-            options.compilerArgs.addAll(['--add-exports', 'java.base/java.net=ALL-UNNAMED'])
-            options.compilerArgs.addAll(['--add-exports', 'java.base/sun.nio.ch=ALL-UNNAMED'])
-            options.compilerArgs.addAll(['--add-exports', 'java.base/jdk.internal.ref=ALL-UNNAMED'])
-            options.compilerArgs.addAll(['--add-exports', 'jdk.unsupported/sun.misc=ALL-UNNAMED'])
-        }
         options.encoding = 'UTF-8'
         options.deprecation = true
     }
@@ -160,8 +153,10 @@ subprojects {
         enableAssertions = true
         jvmArgs('-Ddisable.thread.safety=true')
 
-        jvmArgs('--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED')
-        jvmArgs('--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED')
+        //the only JDK internals needed, see UnsafeAccess; the others are reached through its trusted lookup
+        jvmArgs('--add-exports', 'java.base/jdk.internal.misc=ALL-UNNAMED')
+        //thread affinity through FFM or Agrona calls native code, which Java 24+ warns about otherwise
+        jvmArgs('--enable-native-access=ALL-UNNAMED')
 
         useJUnitPlatform {
             excludeTags 'perf'
@@ -194,15 +189,6 @@ subprojects {
         enableAssertions = false
         jvmArgs('-Djvm.resource.tracing=false')
         jvmArgs('-Ddisable.thread.safety=true')
-
-        if (JavaVersion.current().isJava9Compatible()) {
-            jvmArgs('--add-opens', 'java.base/java.lang.reflect=ALL-UNNAMED')
-            jvmArgs('--add-opens', 'java.base/java.net=ALL-UNNAMED')
-            jvmArgs('--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED')
-            jvmArgs('--add-opens', 'java.base/jdk.internal.ref=ALL-UNNAMED')
-            jvmArgs('--add-opens', 'java.base/java.util.zip=ALL-UNNAMED')
-            jvmArgs('--add-exports', 'jdk.unsupported/sun.misc=ALL-UNNAMED')
-        }
 
         useJUnitPlatform {
             excludeTags = [] as Set // inherited from tasks.withType(Test) above
@@ -294,7 +280,7 @@ subprojects {
 }
 
 project(':mmap-core') {
-    //memory access through jdk.internal.misc.Unsafe, exported at run time with the same flag Agrona needs
+    //memory access through jdk.internal.misc.Unsafe, exported at run time with --add-opens or --add-exports
     tasks.withType(JavaCompile).configureEach {
         options.compilerArgs.addAll(['--add-exports', 'java.base/jdk.internal.misc=ALL-UNNAMED'])
     }
@@ -368,6 +354,9 @@ project(':mmap-core') {
         compileOnly "org.slf4j:slf4j-api:${slf4jVersion}"
         testImplementation "org.slf4j:slf4j-api:${slf4jVersion}"
         testRuntimeOnly "org.slf4j:slf4j-simple:${slf4jVersion}"
+        //optional: thread affinity through Agrona if present on the class path, see AffinityMode
+        compileOnly "org.agrona:agrona:${agronaVersion}"
+        testImplementation "org.agrona:agrona:${agronaVersion}"
     }
 
     jar {
@@ -381,7 +370,7 @@ project(':mmap-core') {
                 Implementation-Title:   mmap
                 Implementation-Vendor:  tools4j.org
                 Implementation-Version: ${projVersion}
-                Import-Package:         org.slf4j.*;resolution:=optional, java.lang.foreign;resolution:=optional, *
+                Import-Package:         org.slf4j.*;resolution:=optional, org.agrona.*;resolution:=optional, java.lang.foreign;resolution:=optional, *
                 # Java 17, not derived from the classes, as memory access through FFM is loaded on Java 22+ only
                 Require-Capability:     osgi.ee;filter:="(&(osgi.ee=JavaSE)(version=17))"
                 -noee: true
@@ -403,7 +392,6 @@ project(':mmap-core') {
 project(':mmap-mapping') {
     dependencies {
         api project(':mmap-core')
-        api "org.agrona:agrona:${agronaVersion}"
         testImplementation "org.slf4j:slf4j-api:${slf4jVersion}"
         testRuntimeOnly "org.slf4j:slf4j-simple:${slf4jVersion}"
     }
@@ -436,7 +424,6 @@ project(':mmap-mapping') {
 
 project(':mmap-queue') {
     dependencies {
-        api "org.agrona:agrona:${agronaVersion}"
         api project(':mmap-mapping')
 
         testImplementation "org.slf4j:slf4j-api:${slf4jVersion}"
@@ -475,6 +462,7 @@ project(':mmap-perf') {
     //JVM args for the mmap and chronicle queues, see https://chronicle.software/chronicle-support-java-17/
     def perfJvmArgs = [
             '-Dorg.slf4j.simpleLogger.defaultLogLevel=warn',
+            '--enable-native-access=ALL-UNNAMED', //thread affinity through FFM or Agrona, see AffinityMode
             '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED',
             '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
             '--add-opens', 'java.base/java.lang.reflect=ALL-UNNAMED',
@@ -575,6 +563,7 @@ project(':mmap-perf') {
 
     dependencies {
         jmhImplementation project(':mmap-core')
+        jmhImplementation project(':mmap-mapping')
         jmhImplementation "org.agrona:agrona:${agronaVersion}"
         jmhImplementation "net.openhft:chronicle-bytes:${chronicleBytesVersion}"
         jmhImplementation "io.netty:netty-buffer:${nettyVersion}"

@@ -39,16 +39,18 @@ try (Queue queue = Queue.open(new File("/tmp/myQueue"))) {
     }) > 0);
 }
 ```
-More in [Mappings](docs/mappings.md), [Queues](docs/queues.md), [Memory buffers](docs/memory-buffers.md) and
-[Benchmarks](docs/benchmarks.md).
+More in [Mappings](docs/mappings.md), [Queues](docs/queues.md), [Memory buffers](docs/memory-buffers.md),
+[JVM options](docs/jvm-options.md) and [Benchmarks](docs/benchmarks.md).
 
 ### Maven/Gradle
 
-Requires Java 17 or later, and the following JVM options:
+Requires Java 17 or later, and the following JVM option (`--add-opens` works too):
 ```
---add-opens=java.base/sun.nio.ch=ALL-UNNAMED
---add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED
 ```
+Optional features, such as memory access through the Foreign Function and Memory API or CPU pinning, need further
+options; see [JVM options](docs/jvm-options.md).
+
 `mmap-queue` includes `mmap-mapping`, which includes `mmap-core`; use `mmap-mapping` alone if you only need
 mappings, or `mmap-core` alone for the memory buffers.
 
